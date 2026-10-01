@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 from app.core.config import settings
 from app.dependencies.database import DbSession
-
+from app.api.v1.router import api_router
 
 app = FastAPI(
     title=settings.app_name,
@@ -10,7 +10,10 @@ app = FastAPI(
     description="Production-grade Order & Inventory Management API"
 )
 
-
+app.include_router(
+    api_router,
+    prefix="/api/v1",
+)
 @app.get("/health", tags=["Health"])
 async def health_check() -> dict[str, str]:
     return {"status": "ok"}
