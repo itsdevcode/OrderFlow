@@ -4,3 +4,4 @@ venv/
 # Python cache
 __pycache__/
 *.py[cod]
+alembic/script.py.mako
