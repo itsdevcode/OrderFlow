@@ -65,7 +65,8 @@ async def client(
 ) -> AsyncGenerator[AsyncClient, None]:
 
     async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
-        yield db_session
+        async with TestSessionLocal() as session:
+            yield session
 
     app.dependency_overrides[get_db] = override_get_db
 

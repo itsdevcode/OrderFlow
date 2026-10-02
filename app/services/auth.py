@@ -42,6 +42,7 @@ class AuthService:
             expires_at=expires_at,
         )
         await self.refresh_token_repository.create(rt_record)
+        await self.user_repository.db.commit()
 
         return TokenResponse(
             access_token=create_access_token(user.id),
@@ -91,6 +92,7 @@ class AuthService:
 
         if rt_record.is_revoked:
             await self.refresh_token_repository.revoke_all_for_user(user_id)
+            await self.refresh_token_repository.db.commit()
             raise InvalidTokenError
 
         user = await self.user_repository.get_by_id(user_id)
@@ -110,6 +112,7 @@ class AuthService:
             expires_at=expires_at,
         )
         await self.refresh_token_repository.create(new_rt_record)
+        await self.refresh_token_repository.db.commit()
 
         return TokenResponse(
             access_token=create_access_token(user.id),
@@ -129,3 +132,4 @@ class AuthService:
             raise InvalidTokenError from exc
 
         await self.refresh_token_repository.revoke(jti)
+        await self.refresh_token_repository.db.commit()

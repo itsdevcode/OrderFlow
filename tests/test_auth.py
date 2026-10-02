@@ -229,3 +229,46 @@ async def test_logout_invalidates_refresh_token(
         json={"refresh_token": refresh_token},
     )
     assert refresh_response.status_code == 401
+
+
+async def test_logout_persists_in_database(
+    client: AsyncClient,
+    customer_user: User,
+) -> None:
+    from app.core.jwt import decode_token
+    from tests.conftest import TestSessionLocal
+    from app.models.refresh_token import RefreshToken
+    from sqlalchemy import select
+
+    # 1. Login to get a token
+    login_response = await client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": customer_user.email,
+            "password": "CustomerPassword123!",
+        },
+    )
+    refresh_token = login_response.json()["refresh_token"]
+    
+    payload = decode_token(refresh_token)
+    jti = payload["jti"]
+
+    # Verify it exists and is NOT revoked
+    async with TestSessionLocal() as session:
+        result = await session.execute(select(RefreshToken).where(RefreshToken.jti == jti))
+        db_token = result.scalar_one_or_none()
+        assert db_token is not None
+        assert db_token.is_revoked is False
+
+    # 2. Logout (this happens in a separate request/transaction)
+    await client.post(
+        "/api/v1/auth/logout",
+        json={"refresh_token": refresh_token},
+    )
+
+    # 3. Open a completely new raw DB session and verify it was actually committed!
+    async with TestSessionLocal() as new_session:
+        new_result = await new_session.execute(select(RefreshToken).where(RefreshToken.jti == jti))
+        updated_token = new_result.scalar_one_or_none()
+        assert updated_token is not None
+        assert updated_token.is_revoked is True
