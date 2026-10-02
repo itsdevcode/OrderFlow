@@ -1,3 +1,4 @@
+from typing import cast
 from httpx import AsyncClient
 
 from app.models.user import User
@@ -18,7 +19,7 @@ async def login_and_get_access_token(
 
     assert response.status_code == 200
 
-    return response.json()["access_token"]
+    return cast(str, response.json()["access_token"])
 
 
 async def test_create_user_without_token(
@@ -61,7 +62,7 @@ async def test_customer_cannot_create_user(
     )
 
     assert response.status_code == 403
-    assert response.json()["detail"] == "Insufficient permissions"
+    assert cast(dict[str, object], response.json())["detail"] == "Insufficient permissions"
 
 
 async def test_admin_can_create_user(
