@@ -2,7 +2,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import User
-
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 class UserRepository:
     db: AsyncSession
@@ -84,3 +85,14 @@ class UserRepository:
     async def delete(self, user: User) -> None:
         await self.db.delete(user)
         await self.db.flush()
+
+    async def get_by_id(self, user_id: int) -> User | None:
+        stmt = (
+            select(User)
+            .options(selectinload(User.role))
+            .where(User.id == user_id)
+        )
+
+        result = await self.db.execute(stmt)
+
+        return result.scalar_one_or_none()
