@@ -31,7 +31,7 @@ async def get_current_user(
 
         subject = payload.get("sub")
 
-        if subject is None:
+        if not isinstance(subject, (str, int)):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token",
