@@ -90,6 +90,9 @@ class AuthService:
         if rt_record is None:
             raise InvalidTokenError
 
+        if rt_record.user_id != user_id:
+            raise InvalidTokenError
+
         if rt_record.is_revoked:
             await self.refresh_token_repository.revoke_all_for_user(user_id)
             await self.refresh_token_repository.db.commit()
@@ -125,11 +128,24 @@ class AuthService:
             if payload.get("type") != "refresh":
                 raise InvalidTokenError
             
+            subject = payload.get("sub")
+            if not isinstance(subject, (str, int)):
+                raise InvalidTokenError
+
+            user_id = int(subject)
+
             jti = payload.get("jti")
             if not isinstance(jti, str):
                 raise InvalidTokenError
         except (jwt.InvalidTokenError, ValueError) as exc:
             raise InvalidTokenError from exc
+
+        rt_record = await self.refresh_token_repository.get_by_jti(jti)
+        if rt_record is None:
+            raise InvalidTokenError
+        
+        if rt_record.user_id != user_id:
+            raise InvalidTokenError
 
         await self.refresh_token_repository.revoke(jti)
         await self.refresh_token_repository.db.commit()
