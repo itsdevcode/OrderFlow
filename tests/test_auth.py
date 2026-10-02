@@ -162,5 +162,70 @@ async def test_refresh_rejects_invalid_token(
             "refresh_token": "not-a-valid-jwt",
         },
     )
-
     assert response.status_code == 401
+
+
+async def test_refresh_token_revoked_reuse_detection(
+    client: AsyncClient,
+    customer_user: User,
+) -> None:
+    login_response = await client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": customer_user.email,
+            "password": "CustomerPassword123!",
+        },
+    )
+    refresh_token = login_response.json()["refresh_token"]
+
+    # First refresh should succeed
+    refresh_response_1 = await client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": refresh_token},
+    )
+    assert refresh_response_1.status_code == 200
+
+    # The first refresh token is now revoked.
+    # A second attempt to use the revoked token should trigger reuse detection.
+    # It should fail and revoke ALL tokens.
+    refresh_response_2 = await client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": refresh_token},
+    )
+    assert refresh_response_2.status_code == 401
+
+    # The new refresh token from the first refresh should also now be revoked!
+    new_refresh_token = refresh_response_1.json()["refresh_token"]
+    refresh_response_3 = await client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": new_refresh_token},
+    )
+    assert refresh_response_3.status_code == 401
+
+
+async def test_logout_invalidates_refresh_token(
+    client: AsyncClient,
+    customer_user: User,
+) -> None:
+    login_response = await client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": customer_user.email,
+            "password": "CustomerPassword123!",
+        },
+    )
+    refresh_token = login_response.json()["refresh_token"]
+
+    # Logout
+    logout_response = await client.post(
+        "/api/v1/auth/logout",
+        json={"refresh_token": refresh_token},
+    )
+    assert logout_response.status_code == 204
+
+    # Refresh should fail after logout
+    refresh_response = await client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": refresh_token},
+    )
+    assert refresh_response.status_code == 401

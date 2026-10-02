@@ -25,7 +25,7 @@ def create_access_token(user_id: int) -> str:
     )
 
 
-def create_refresh_token(user_id: int) -> str:
+def create_refresh_token(user_id: int, jti: str) -> str:
     now = datetime.now(UTC)
 
     payload = {
@@ -35,6 +35,7 @@ def create_refresh_token(user_id: int) -> str:
         "exp": now + timedelta(
             days=settings.refresh_token_expire_days
         ),
+        "jti": jti,
     }
 
     return jwt.encode(

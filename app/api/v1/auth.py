@@ -63,7 +63,27 @@ async def refresh(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
         ) from exc
-    
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def logout(
+    data: RefreshRequest,
+    db: DbSession,
+) -> None:
+    service = AuthService(db)
+
+    try:
+        await service.logout(data.refresh_token)
+    except InvalidTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        ) from exc
+
+
 @router.get(
     "/me",
     response_model=UserRead,
