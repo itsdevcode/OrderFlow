@@ -1,3 +1,4 @@
+from typing import cast
 from httpx import AsyncClient
 
 from app.models.user import User
@@ -7,7 +8,7 @@ async def test_health(client: AsyncClient) -> None:
     response = await client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert cast(dict[str, object], response.json()) == {"status": "ok"}
 
 
 async def test_login_success(
@@ -24,7 +25,7 @@ async def test_login_success(
 
     assert response.status_code == 200
 
-    data = response.json()
+    data = cast(dict[str, object], response.json())
 
     assert data["access_token"]
     assert data["refresh_token"]
@@ -44,7 +45,7 @@ async def test_login_wrong_password(
     )
 
     assert response.status_code == 401
-    assert response.json()["detail"] == "Invalid email or password"
+    assert cast(dict[str, object], response.json())["detail"] == "Invalid email or password"
 
 
 async def test_me_with_access_token(
@@ -61,7 +62,7 @@ async def test_me_with_access_token(
 
     assert login_response.status_code == 200
 
-    access_token = login_response.json()["access_token"]
+    access_token = cast(str, login_response.json()["access_token"])
 
     response = await client.get(
         "/api/v1/auth/me",
@@ -71,7 +72,7 @@ async def test_me_with_access_token(
     )
 
     assert response.status_code == 200
-    assert response.json()["email"] == customer_user.email
+    assert cast(dict[str, object], response.json())["email"] == customer_user.email
 
 
 async def test_me_rejects_refresh_token(
@@ -88,7 +89,7 @@ async def test_me_rejects_refresh_token(
 
     assert login_response.status_code == 200
 
-    refresh_token = login_response.json()["refresh_token"]
+    refresh_token = cast(str, login_response.json()["refresh_token"])
 
     response = await client.get(
         "/api/v1/auth/me",
@@ -98,7 +99,7 @@ async def test_me_rejects_refresh_token(
     )
 
     assert response.status_code == 401
-    assert response.json()["detail"] == "Invalid token type"
+    assert cast(dict[str, object], response.json())["detail"] == "Invalid token type"
 
 async def test_refresh_token_success(
     client: AsyncClient,
@@ -112,7 +113,7 @@ async def test_refresh_token_success(
         },
     )
 
-    refresh_token = login_response.json()["refresh_token"]
+    refresh_token = cast(str, login_response.json()["refresh_token"])
 
     response = await client.post(
         "/api/v1/auth/refresh",
@@ -123,7 +124,7 @@ async def test_refresh_token_success(
 
     assert response.status_code == 200
 
-    data = response.json()
+    data = cast(dict[str, object], response.json())
 
     assert data["access_token"]
     assert data["token_type"] == "bearer"
@@ -141,7 +142,7 @@ async def test_refresh_rejects_access_token(
         },
     )
 
-    access_token = login_response.json()["access_token"]
+    access_token = cast(str, login_response.json()["access_token"])
 
     response = await client.post(
         "/api/v1/auth/refresh",
@@ -176,7 +177,7 @@ async def test_refresh_token_revoked_reuse_detection(
             "password": "CustomerPassword123!",
         },
     )
-    refresh_token = login_response.json()["refresh_token"]
+    refresh_token = cast(str, login_response.json()["refresh_token"])
 
     # First refresh should succeed
     refresh_response_1 = await client.post(
@@ -195,7 +196,7 @@ async def test_refresh_token_revoked_reuse_detection(
     assert refresh_response_2.status_code == 401
 
     # The new refresh token from the first refresh should also now be revoked!
-    new_refresh_token = refresh_response_1.json()["refresh_token"]
+    new_refresh_token = cast(str, refresh_response_1.json()["refresh_token"])
     refresh_response_3 = await client.post(
         "/api/v1/auth/refresh",
         json={"refresh_token": new_refresh_token},
@@ -214,7 +215,7 @@ async def test_logout_invalidates_refresh_token(
             "password": "CustomerPassword123!",
         },
     )
-    refresh_token = login_response.json()["refresh_token"]
+    refresh_token = cast(str, login_response.json()["refresh_token"])
 
     # Logout
     logout_response = await client.post(
@@ -248,7 +249,7 @@ async def test_logout_persists_in_database(
             "password": "CustomerPassword123!",
         },
     )
-    refresh_token = login_response.json()["refresh_token"]
+    refresh_token = cast(str, login_response.json()["refresh_token"])
     
     payload = decode_token(refresh_token)
     jti = payload["jti"]

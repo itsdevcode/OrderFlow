@@ -22,7 +22,7 @@ from app.models.user import User
 
 TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL",
-    "postgresql+asyncpg://orderflow_user:YOUR_PASSWORD@localhost:5432/orderflow_test",
+    "postgresql+asyncpg://orderflow_user:orderflow_password@localhost:5432/orderflow_test",
 )
 
 test_engine = create_async_engine(
