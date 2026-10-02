@@ -4,7 +4,7 @@ from app.dependencies.database import DbSession
 from app.exceptions.user import RoleNotFoundError, UserAlreadyExistsError
 from app.schemas.user import UserCreate, UserRead
 from app.services.user import UserService
-
+from app.dependencies.permissions import AdminUser
 
 router = APIRouter(
     prefix="/users",
@@ -20,6 +20,7 @@ router = APIRouter(
 async def create_user(
     data: UserCreate,
     db: DbSession,
+    _: AdminUser,
 ) -> UserRead:
     service = UserService(db)
 

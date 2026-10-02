@@ -1,13 +1,15 @@
+import jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import verify_password
 from app.exceptions.auth import (
     InactiveUserError,
     InvalidCredentialsError,
+    InvalidTokenError,
 )
 from app.models.user import User
 from app.repositories.user import UserRepository
-from app.core.jwt import create_access_token, create_refresh_token
+from app.core.jwt import create_access_token, create_refresh_token, decode_token
 from app.schemas.auth import TokenResponse
 
 class AuthService:
@@ -45,3 +47,28 @@ class AuthService:
             raise InactiveUserError
 
         return user
+
+    async def refresh(self, refresh_token: str) -> TokenResponse:
+        try:
+            payload = decode_token(refresh_token)
+
+            if payload.get("type") != "refresh":
+                raise InvalidTokenError
+
+            subject = payload.get("sub")
+            if not isinstance(subject, (str, int)):
+                raise InvalidTokenError
+
+            user_id = int(subject)
+        except (jwt.InvalidTokenError, ValueError) as exc:
+            raise InvalidTokenError from exc
+
+        user = await self.user_repository.get_by_id(user_id)
+
+        if user is None or not user.is_active:
+            raise InvalidTokenError
+
+        return TokenResponse(
+            access_token=create_access_token(user.id),
+            refresh_token=create_refresh_token(user.id),
+        )
