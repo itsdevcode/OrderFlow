@@ -98,3 +98,40 @@ async def test_inventory_concurrent_adjustment(client: AsyncClient, admin_user: 
     get_resp = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
     assert get_resp.status_code == 200
     assert get_resp.json()["available_quantity"] == 10
+
+async def test_inventory_rollback_on_negative_adjustment(client: AsyncClient, admin_user: User) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+    cat_resp = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "RBCat", "slug": "rbcat"})
+    cat_id = cast(int, cat_resp.json()["id"])
+    prod_resp = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "RBProd", "slug": "rbprod", "sku": "RBSKU", "price": 10.0, "category_id": cat_id
+    })
+    prod_id = cast(int, prod_resp.json()["id"])
+    wh_resp = await client.post("/api/v1/warehouses", headers=admin_headers, json={"code": "WH_RB", "name": "Warehouse RB"})
+    wh_id = cast(int, wh_resp.json()["id"])
+
+    # Initial valid adjustment
+    await client.post(
+        f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust",
+        headers=admin_headers,
+        json={"available_quantity_change": 10}
+    )
+
+    # Failed negative adjustment
+    bad_resp = await client.post(
+        f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust",
+        headers=admin_headers,
+        json={"available_quantity_change": -20}
+    )
+    assert bad_resp.status_code == 409
+
+    # Next valid adjustment (should succeed, lock must have been released)
+    good_resp = await client.post(
+        f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust",
+        headers=admin_headers,
+        json={"available_quantity_change": 5}
+    )
+    assert good_resp.status_code == 200
+    assert good_resp.json()["available_quantity"] == 15
