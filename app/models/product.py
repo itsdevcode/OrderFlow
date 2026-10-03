@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 class Product(Base):
     __tablename__: str = "products"
-    __table_args__ = (
+    __table_args__: tuple[CheckConstraint, ...] = (
         CheckConstraint("price >= 0", name="check_product_price_non_negative"),
     )
 
