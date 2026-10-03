@@ -113,6 +113,15 @@ async def test_product_crud_and_rbac(client: AsyncClient, admin_user: User, cust
     assert body["slug"] == "p1-upd"
     assert body["price"] == "15.00"
 
+    # Explicit null validation tests
+    response = await client.patch(f"/api/v1/products/{prod_id}", headers=admin_headers, json={"price": None})
+    assert response.status_code == 422
+
+    response = await client.patch(f"/api/v1/products/{prod_id}", headers=admin_headers, json={"sku": None})
+    assert response.status_code == 422
+
+    response = await client.patch(f"/api/v1/products/{prod_id}", headers=admin_headers, json={"category_id": None})
+    assert response.status_code == 422
     # Duplicate protection on update
     response = await client.patch(f"/api/v1/products/{prod_id}", headers=admin_headers, json={"slug": "p2"})
     assert response.status_code == 409

@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ProductCreate(BaseModel):
@@ -16,13 +16,21 @@ class ProductCreate(BaseModel):
 
 
 class ProductUpdate(BaseModel):
-    name: str = Field(default=None)  # pyright: ignore[reportAssignmentType]
-    slug: str = Field(default=None)  # pyright: ignore[reportAssignmentType]
-    sku: str = Field(default=None)  # pyright: ignore[reportAssignmentType]
+    name: str | None = Field(default=None)
+    slug: str | None = Field(default=None)
+    sku: str | None = Field(default=None)
     description: str | None = None
-    price: Decimal = Field(default=None, ge=0)  # pyright: ignore[reportAssignmentType]
-    is_active: bool = Field(default=None)  # pyright: ignore[reportAssignmentType]
-    category_id: int = Field(default=None)  # pyright: ignore[reportAssignmentType]
+    price: Decimal | None = Field(default=None, ge=0)   
+    is_active: bool | None = Field(default=None)    
+    category_id: int | None = Field(default=None)
+
+    @model_validator(mode="after")
+    def check_explicit_nulls(self):
+        non_nullable_fields = {"name", "slug", "sku", "price", "is_active", "category_id"}
+        for field in non_nullable_fields:
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be explicitly null")
+        return self
 
 
 class ProductRead(BaseModel):
