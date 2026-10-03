@@ -30,8 +30,8 @@ class ProductService:
             raise ProductAlreadyExistsError(f"Product with slug '{data.slug}' already exists")
 
         # Check if price valid
-        if data.price <= 0:
-            raise InvalidPriceError("Price must be greater than zero")
+        if data.price < 0:
+            raise InvalidPriceError("Price must be greater than or equal to zero")
 
         try:
             # Create product using repository

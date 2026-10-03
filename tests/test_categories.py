@@ -60,6 +60,12 @@ async def test_category_crud_and_rbac(client: AsyncClient, admin_user: User, cus
     category_upd = cast(dict[str, object], response.json())
     assert category_upd["name"] == "Cat1-upd"
 
+    # Explicit null validation tests
+    response = await client.patch(f"/api/v1/categories/{category_id}", headers=admin_headers, json={"name": None})
+    assert response.status_code == 422
+
+    response = await client.patch(f"/api/v1/categories/{category_id}", headers=admin_headers, json={"is_active": None})
+    assert response.status_code == 422
     # 8. Category-with-products delete -> 409
     response = await client.post("/api/v1/products", headers=admin_headers, json={
         "name": "Prod1", "slug": "prod1", "sku": "SKU1", "price": 10.0, "category_id": category_id
