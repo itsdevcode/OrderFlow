@@ -3,6 +3,7 @@ from app.models.product import Product
 from app.models.role import Role
 from app.models.user import User
 from app.models.refresh_token import RefreshToken
+from app.models.warehouse import Warehouse
 
 __all__ = [
     "Category",
@@ -10,4 +11,5 @@ __all__ = [
     "Role",
     "User",
     "RefreshToken",
+    "Warehouse",
 ]
