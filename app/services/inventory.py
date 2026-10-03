@@ -52,8 +52,10 @@ class InventoryService:
         inventory.reserved_quantity += adjustment.reserved_quantity_change
 
         if inventory.available_quantity < 0:
+            await self.db.rollback()
             raise InsufficientStockError("Available quantity cannot be negative")
         if inventory.reserved_quantity < 0:
+            await self.db.rollback()
             raise InsufficientStockError("Reserved quantity cannot be negative")
 
         try:
