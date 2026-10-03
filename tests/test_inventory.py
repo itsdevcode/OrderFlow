@@ -1,6 +1,7 @@
 from httpx import AsyncClient
 from app.models.user import User
 from typing import cast
+import asyncio
 
 async def login_and_get_access_token(client: AsyncClient, email: str, password: str) -> str:
     response = await client.post("/api/v1/auth/login", json={"email": email, "password": password})
@@ -68,4 +69,32 @@ async def test_inventory_crud_and_rbac(client: AsyncClient, admin_user: User, cu
         headers=admin_headers,
         json={"available_quantity_change": 5}
     )
-    assert bad_wh_adj.status_code == 400  # Invalid product or warehouse ID
+    assert bad_wh_adj.status_code == 404  # WarehouseNotFoundError
+
+async def test_inventory_concurrent_adjustment(client: AsyncClient, admin_user: User) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+    cat_resp = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "CCat", "slug": "ccat"})
+    cat_id = cast(int, cat_resp.json()["id"])
+    prod_resp = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "CProd", "slug": "cprod", "sku": "CSKU", "price": 10.0, "category_id": cat_id
+    })
+    prod_id = cast(int, prod_resp.json()["id"])
+    wh_resp = await client.post("/api/v1/warehouses", headers=admin_headers, json={"code": "WH_C", "name": "Warehouse C"})
+    wh_id = cast(int, wh_resp.json()["id"])
+
+    async def make_request():
+        return await client.post(
+            f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust",
+            headers=admin_headers,
+            json={"available_quantity_change": 2}
+        )
+
+    responses = await asyncio.gather(*(make_request() for _ in range(5)))
+    for r in responses:
+        assert r.status_code == 200
+
+    get_resp = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
+    assert get_resp.status_code == 200
+    assert get_resp.json()["available_quantity"] == 10

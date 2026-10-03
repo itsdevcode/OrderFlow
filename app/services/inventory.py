@@ -3,6 +3,8 @@ from sqlalchemy.exc import IntegrityError
 from app.models.inventory import Inventory
 from app.repositories.inventory import InventoryRepository
 from app.exceptions.inventory import InventoryNotFoundError, InsufficientStockError
+from app.exceptions.product import ProductNotFoundError
+from app.exceptions.warehouse import WarehouseNotFoundError
 from app.schemas.inventory import InventoryAdjustment
 
 class InventoryService:
@@ -24,14 +26,25 @@ class InventoryService:
 
     async def adjust_stock(self, product_id: int, warehouse_id: int, adjustment: InventoryAdjustment) -> Inventory:
         # Fetch or create
-        inventory = await self.inventory_repo.get_by_product_and_warehouse(product_id, warehouse_id)
+        inventory = await self.inventory_repo.get_by_product_and_warehouse(product_id, warehouse_id, for_update=True)
         if not inventory:
             # We create it if it doesn't exist to allow initialization
             try:
                 inventory = await self.inventory_repo.create(product_id, warehouse_id)
             except IntegrityError as exc:
-                # E.g. invalid product_id or warehouse_id
                 await self.db.rollback()
+                error_msg = str(exc.orig).lower() if exc.orig else ""
+                
+                # If another transaction created it concurrently, retry the whole adjustment
+                if "unique" in error_msg or "uq_inventory_product_warehouse" in error_msg:
+                    return await self.adjust_stock(product_id, warehouse_id, adjustment)
+                    
+                if "foreign key" in error_msg or "fkey" in error_msg:
+                    if "product" in error_msg:
+                        raise ProductNotFoundError(f"Product {product_id} not found") from exc
+                    if "warehouse" in error_msg:
+                        raise WarehouseNotFoundError(f"Warehouse {warehouse_id} not found") from exc
+                        
                 raise ValueError("Invalid product or warehouse ID") from exc
         
         # Apply adjustment
