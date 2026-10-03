@@ -5,6 +5,8 @@ from app.dependencies.auth import CurrentUser
 from app.dependencies.database import DbSession
 from app.dependencies.permissions import require_roles
 from app.exceptions.inventory import InventoryNotFoundError, InsufficientStockError
+from app.exceptions.product import ProductNotFoundError
+from app.exceptions.warehouse import WarehouseNotFoundError
 from app.schemas.inventory import InventoryAdjustment, InventoryResponse
 from app.services.inventory import InventoryService
 
@@ -44,7 +46,7 @@ async def adjust_stock(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    except InventoryNotFoundError as exc:
+    except (InventoryNotFoundError, ProductNotFoundError, WarehouseNotFoundError) as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
 @router.get(
