@@ -3,7 +3,7 @@ from sqlalchemy.exc import IntegrityError
 from app.models.warehouse import Warehouse
 from app.repositories.warehouse import WarehouseRepository
 from app.schemas.warehouse import WarehouseCreate, WarehouseUpdate
-from app.exceptions.warehouse import WarehouseAlreadyExistsError, WarehouseNotFoundError
+from app.exceptions.warehouse import WarehouseAlreadyExistsError, WarehouseNotFoundError, WarehouseInUseError
 
 class WarehouseService:
     db: AsyncSession
@@ -62,4 +62,4 @@ class WarehouseService:
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
-            raise WarehouseAlreadyExistsError("Cannot delete warehouse due to database integrity constraints") from exc
+            raise WarehouseInUseError("Cannot delete warehouse as it is currently in use") from exc

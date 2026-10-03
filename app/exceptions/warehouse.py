@@ -6,3 +6,6 @@ class WarehouseAlreadyExistsError(WarehouseError):
 
 class WarehouseNotFoundError(WarehouseError):
     pass
+
+class WarehouseInUseError(WarehouseError):
+    pass

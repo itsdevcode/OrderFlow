@@ -60,6 +60,9 @@ async def test_warehouse_crud_and_rbac(client: AsyncClient, admin_user: User, cu
     response = await client.patch(f"/api/v1/warehouses/{warehouse_id}", headers=admin_headers, json={"code": None})
     assert response.status_code == 422
 
+    response = await client.patch(f"/api/v1/warehouses/{warehouse_id}", headers=admin_headers, json={"is_active": None})
+    assert response.status_code == 422
+
     # 8. Admin delete success
     response = await client.post("/api/v1/warehouses", headers=admin_headers, json={"code": "W2", "name": "Warehouse 2"})
     w2_id: int = cast(int, response.json()["id"])

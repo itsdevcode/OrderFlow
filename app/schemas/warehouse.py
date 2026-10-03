@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import ClassVar
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 class WarehouseCreate(BaseModel):
     code: str
@@ -9,10 +9,10 @@ class WarehouseCreate(BaseModel):
     is_active: bool = True
 
 class WarehouseUpdate(BaseModel):
-    code: str = Field(default=None)  # pyright: ignore[reportAssignmentType]
-    name: str = Field(default=None)  # pyright: ignore[reportAssignmentType]
+    code: str | None = None
+    name: str | None = None
     address: str | None = None
-    is_active: bool = Field(default=None)  # pyright: ignore[reportAssignmentType]
+    is_active: bool | None = None
 
     @model_validator(mode="after")
     def check_explicit_nulls(self):

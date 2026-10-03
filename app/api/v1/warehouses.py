@@ -4,7 +4,7 @@ from app.core.roles import RoleName
 from app.dependencies.auth import CurrentUser
 from app.dependencies.database import DbSession
 from app.dependencies.permissions import require_roles
-from app.exceptions.warehouse import WarehouseAlreadyExistsError, WarehouseNotFoundError
+from app.exceptions.warehouse import WarehouseAlreadyExistsError, WarehouseNotFoundError, WarehouseInUseError
 from app.schemas.warehouse import WarehouseCreate, WarehouseResponse, WarehouseUpdate
 from app.services.warehouse import WarehouseService
 
@@ -76,5 +76,5 @@ async def delete_warehouse(
         await WarehouseService(db).delete_warehouse(warehouse_id)
     except WarehouseNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    except Exception as exc:
+    except WarehouseInUseError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
