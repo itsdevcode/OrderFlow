@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -13,6 +13,9 @@ if TYPE_CHECKING:
 
 class Product(Base):
     __tablename__: str = "products"
+    __table_args__ = (
+        CheckConstraint("price >= 0", name="check_product_price_non_negative"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
 

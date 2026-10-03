@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import ClassVar
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProductCreate(BaseModel):
@@ -10,19 +10,19 @@ class ProductCreate(BaseModel):
     slug: str
     sku: str
     description: str | None = None
-    price: Decimal
+    price: Decimal = Field(ge=0)
     is_active: bool = True
     category_id: int
 
 
 class ProductUpdate(BaseModel):
-    name: str | None = None
-    slug: str | None = None
-    sku: str | None = None
+    name: str = Field(default=None)  # pyright: ignore[reportAssignmentType]
+    slug: str = Field(default=None)  # pyright: ignore[reportAssignmentType]
+    sku: str = Field(default=None)  # pyright: ignore[reportAssignmentType]
     description: str | None = None
-    price: Decimal | None = None
-    is_active: bool | None = None
-    category_id: int | None = None
+    price: Decimal = Field(default=None, ge=0)  # pyright: ignore[reportAssignmentType]
+    is_active: bool = Field(default=None)  # pyright: ignore[reportAssignmentType]
+    category_id: int = Field(default=None)  # pyright: ignore[reportAssignmentType]
 
 
 class ProductRead(BaseModel):
