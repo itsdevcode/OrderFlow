@@ -20,7 +20,7 @@ class ReservationStatus(str, PyEnum):
 
 class InventoryReservation(Base):
     __tablename__: str = "inventory_reservations"
-    __table_args__: tuple = (
+    __table_args__: tuple[CheckConstraint, ...] = (
         CheckConstraint("quantity > 0", name="chk_reservation_quantity_positive"),
     )
 

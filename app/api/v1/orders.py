@@ -19,7 +19,7 @@ from app.exceptions.inventory import InsufficientStockError
 async def create_order(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> OrderRead:
+):
     """Create an order from the authenticated user's cart."""
     try:
         return await OrderService(db).create_order_from_cart(current_user.id)
@@ -39,7 +39,7 @@ async def list_orders(
     limit: int = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> list[OrderRead]:
+):
     """Get the authenticated user's orders."""
     return await OrderService(db).list_orders(current_user.id, offset, limit)
 
@@ -49,7 +49,7 @@ async def get_order(
     order_id: int,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> OrderRead:
+):
     """Get a specific order by ID."""
     try:
         return await OrderService(db).get_order_by_id(current_user.id, order_id)
