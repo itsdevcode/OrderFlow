@@ -13,6 +13,8 @@ from app.exceptions.order import EmptyCartError, OrderNotFoundError
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
 
+from app.exceptions.inventory import InsufficientStockError
+
 @router.post("", response_model=OrderRead, status_code=status.HTTP_201_CREATED)
 async def create_order(
     current_user: User = Depends(get_current_user),
@@ -27,6 +29,8 @@ async def create_order(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except ProductNotActiveError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except InsufficientStockError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 
 @router.get("", response_model=list[OrderRead], status_code=status.HTTP_200_OK)

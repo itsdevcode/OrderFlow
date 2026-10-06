@@ -22,6 +22,16 @@ class InventoryRepository:
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_all_for_update_by_product(self, product_id: int) -> list[Inventory]:
+        stmt = (
+            select(Inventory)
+            .where(Inventory.product_id == product_id)
+            .order_by(Inventory.warehouse_id.asc())
+            .with_for_update()
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
     async def list_by_product(self, product_id: int, *, offset: int = 0, limit: int = 20) -> list[Inventory]:
         result = await self.db.execute(
             select(Inventory).where(Inventory.product_id == product_id).offset(offset).limit(limit)
