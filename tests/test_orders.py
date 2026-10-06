@@ -72,6 +72,8 @@ async def test_order_lifecycle(client: AsyncClient, db_session: AsyncSession, ad
     
     response = await client.post("/api/v1/cart/items", headers=customer_headers, json={"product_id": prod2_id, "quantity": 1})
     assert response.status_code == 200
+    cart_data = response.json()
+    cart_item_id = next(item["id"] for item in cart_data["items"] if item["product_id"] == prod2_id)
     
     # Make product inactive
     response = await client.patch(f"/api/v1/products/{prod2_id}", headers=admin_headers, json={
@@ -85,7 +87,7 @@ async def test_order_lifecycle(client: AsyncClient, db_session: AsyncSession, ad
     assert "not active" in response.json()["detail"].lower()
     
     # Remove inactive product
-    response = await client.delete(f"/api/v1/cart/items/{prod2_id}", headers=customer_headers)
+    response = await client.delete(f"/api/v1/cart/items/{cart_item_id}", headers=customer_headers)
     assert response.status_code == 200
 
     # 1. Check inventory before order
@@ -188,14 +190,14 @@ async def test_order_rollback_on_failure(client: AsyncClient, db_session: AsyncS
     response = await client.post("/api/v1/cart/items", headers=customer_headers, json={"product_id": prod_id, "quantity": 2})
     assert response.status_code == 200
 
-    # Force a failure during order creation
-    from app.repositories.order import OrderRepository
-    original_create_order = OrderRepository.create_order
+    # Force a failure during order creation after flush but before commit
+    from app.repositories.cart import CartRepository
+    original_clear_cart = CartRepository.clear_cart
     
-    async def mock_create_order(*args, **kwargs):
+    async def mock_clear_cart(*args, **kwargs):
         raise ValueError("Simulated DB failure")
     
-    monkeypatch.setattr(OrderRepository, "create_order", mock_create_order)
+    monkeypatch.setattr(CartRepository, "clear_cart", mock_clear_cart)
 
     # Attempt to create order
     with pytest.raises(ValueError):
