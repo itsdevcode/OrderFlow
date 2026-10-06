@@ -9,6 +9,7 @@ from app.db.base import Base
 if TYPE_CHECKING:
     from app.models.role import Role
     from app.models.cart import Cart
+    from app.models.order import Order
 
 
 class User(Base):
@@ -63,6 +64,11 @@ class User(Base):
     )
 
     cart: Mapped["Cart"] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    orders: Mapped[list["Order"]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",
     )
