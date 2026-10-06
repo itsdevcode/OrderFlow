@@ -123,11 +123,11 @@ async def test_order_lifecycle(client: AsyncClient, db_session: AsyncSession, ad
     assert len(response.json()["items"]) == 0
     assert response.json()["id"] is not None
 
-    # 4. Inventory is UNCHANGED (since we defer to next task)
+    # 4. Inventory is mutated
     inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
     assert inv_response.status_code == 200
-    assert inv_response.json()["available_quantity"] == 50
-    assert inv_response.json()["reserved_quantity"] == 0
+    assert inv_response.json()["available_quantity"] == 48
+    assert inv_response.json()["reserved_quantity"] == 2
 
     # 5. Critical snapshot regression test
     # Change Product.price
@@ -185,6 +185,12 @@ async def test_order_rollback_on_failure(client: AsyncClient, db_session: AsyncS
         "name": "RollbackProd1", "slug": "rollbackprod1", "sku": "RB_SKU1", "price": 100.0, "category_id": cat_id, "is_active": True
     })
     prod_id = cast(int, response.json()["id"])
+
+    response = await client.post("/api/v1/warehouses", headers=admin_headers, json={"code": "RBWH1", "name": "LocRB"})
+    wh_id = cast(int, response.json()["id"])
+    response = await client.post(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
+        "available_quantity_change": 50, "reason": "Restock"
+    })
 
     # Add product to cart
     response = await client.post("/api/v1/cart/items", headers=customer_headers, json={"product_id": prod_id, "quantity": 2})
