@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from typing import cast
 import pytest
 from httpx import AsyncClient
@@ -20,6 +21,20 @@ async def login_and_get_access_token(client: AsyncClient, email: str, password: 
     response = await client.post("/api/v1/auth/login", json={"email": email, "password": password})
     return cast(str, response.json()["access_token"])
 
+
+async def setup_data_unique(client: AsyncClient, admin_token: str) -> tuple[int, int, int]:
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    suffix = uuid.uuid4().hex[:8]
+    response = await client.post("/api/v1/categories", headers=admin_headers, json={"name": f"CatRes_{suffix}", "slug": f"catres_{suffix}"})
+    cat_id = cast(int, response.json()["id"])
+    response = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": f"ResProd1_{suffix}", "slug": f"resprod1_{suffix}", "sku": f"RSKU1_{suffix}", "price": 100.0, "category_id": cat_id, "is_active": True
+    })
+    prod_id = cast(int, response.json()["id"])
+    response = await client.post("/api/v1/warehouses", headers=admin_headers, json={"code": f"RWH1_{suffix}", "name": f"RLoc1_{suffix}"})
+    wh_id = cast(int, response.json()["id"])
+    return cat_id, prod_id, wh_id
+
 async def setup_data(client: AsyncClient, admin_token: str) -> tuple[int, int, int]:
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     response = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "CatRes", "slug": "catres"})
@@ -32,19 +47,20 @@ async def setup_data(client: AsyncClient, admin_token: str) -> tuple[int, int, i
     wh_id = cast(int, response.json()["id"])
     return cat_id, prod_id, wh_id
 
+@pytest.mark.parametrize("run", range(5))
 @pytest.mark.asyncio
-async def test_concurrent_overselling(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User) -> None:
+async def test_concurrent_overselling(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User, run: int) -> None:
     admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
     customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
 
     # Setup Customer 2
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     await client.post("/api/v1/users", headers=admin_headers, json={
-        "email": "cust2_concurrent@example.com", "name": "Cust Two", "password": "Password123!", "role_id": customer_user.role_id
+        "email": f"cust2_concurrent_{run}@example.com", "name": "Cust Two", "password": "Password123!", "role_id": customer_user.role_id
     })
-    customer2_token = await login_and_get_access_token(client, "cust2_concurrent@example.com", "Password123!")
+    customer2_token = await login_and_get_access_token(client, f"cust2_concurrent_{run}@example.com", "Password123!")
 
-    cat_id, prod_id, wh_id = await setup_data(client, admin_token)
+    cat_id, prod_id, wh_id = await setup_data_unique(client, admin_token)
 
     # Set inventory exactly to 1
     await client.post(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
@@ -58,6 +74,7 @@ async def test_concurrent_overselling(client: AsyncClient, db_session: AsyncSess
     await client.post("/api/v1/cart/items", headers=c1_headers, json={"product_id": prod_id, "quantity": 1})
     await client.post("/api/v1/cart/items", headers=c2_headers, json={"product_id": prod_id, "quantity": 1})
 
+    # Independent transactions occur because test client uses override_get_db which creates a new AsyncSession per request
     # Fire both orders concurrently
     req1 = client.post("/api/v1/orders", headers=c1_headers)
     req2 = client.post("/api/v1/orders", headers=c2_headers)
@@ -145,7 +162,7 @@ async def test_reservation_service_methods(client: AsyncClient, db_session: Asyn
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     customer_headers = {"Authorization": f"Bearer {customer_token}"}
 
-    cat_id, prod_id, wh_id = await setup_data(client, admin_token)
+    cat_id, prod_id, wh_id = await setup_data_unique(client, admin_token)
     await client.post(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
         "available_quantity_change": 10, "reason": "Restock"
     })
@@ -235,7 +252,7 @@ async def test_reservation_service_methods(client: AsyncClient, db_session: Asyn
 @pytest.mark.asyncio
 async def test_duplicate_logical_reservation_blocked(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User) -> None:
     admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
-    cat_id, prod_id, wh_id = await setup_data(client, admin_token)
+    cat_id, prod_id, wh_id = await setup_data_unique(client, admin_token)
     
     order = Order(user_id=customer_user.id)
     db_session.add(order)
@@ -255,7 +272,7 @@ async def test_duplicate_logical_reservation_blocked(client: AsyncClient, db_ses
 @pytest.mark.asyncio
 async def test_transition_does_not_commit_unexpectedly(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User) -> None:
     admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
-    cat_id, prod_id, wh_id = await setup_data(client, admin_token)
+    cat_id, prod_id, wh_id = await setup_data_unique(client, admin_token)
     
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     await client.post(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
@@ -292,7 +309,7 @@ async def test_transition_does_not_commit_unexpectedly(client: AsyncClient, db_s
 @pytest.mark.asyncio
 async def test_invalid_reserved_quantity_does_not_go_negative(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User) -> None:
     admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
-    cat_id, prod_id, wh_id = await setup_data(client, admin_token)
+    cat_id, prod_id, wh_id = await setup_data_unique(client, admin_token)
     
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     await client.post(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
@@ -320,7 +337,7 @@ async def test_invalid_reserved_quantity_does_not_go_negative(client: AsyncClien
 @pytest.mark.asyncio
 async def test_missing_inventory_raises_domain_exception(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User) -> None:
     admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
-    cat_id, prod_id, wh_id = await setup_data(client, admin_token)
+    cat_id, prod_id, wh_id = await setup_data_unique(client, admin_token)
     
     inventory = await db_session.execute(select(Inventory).where(Inventory.product_id == prod_id))
     inv_obj = inventory.scalars().first()
@@ -340,3 +357,162 @@ async def test_missing_inventory_raises_domain_exception(client: AsyncClient, db
     with pytest.raises(InventoryNotFoundError) as exc:
         await service.release_reservation(res.id)
     assert "Inventory record missing" in str(exc.value)
+
+
+@pytest.mark.parametrize("run", range(5))
+@pytest.mark.asyncio
+async def test_concurrent_multi_quantity_overselling(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User, run: int) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+
+    # Setup Customer 2
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    await client.post("/api/v1/users", headers=admin_headers, json={
+        "email": f"cust2_multi_{run}@example.com", "name": "Cust Two", "password": "Password123!", "role_id": customer_user.role_id
+    })
+    customer2_token = await login_and_get_access_token(client, f"cust2_multi_{run}@example.com", "Password123!")
+
+    cat_id, prod_id, wh_id = await setup_data_unique(client, admin_token)
+
+    # Set inventory exactly to 5
+    await client.post(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
+        "available_quantity_change": 5, "reason": "Restock"
+    })
+
+    # Both users add product to cart (qty 3)
+    c1_headers = {"Authorization": f"Bearer {customer_token}"}
+    c2_headers = {"Authorization": f"Bearer {customer2_token}"}
+
+    await client.post("/api/v1/cart/items", headers=c1_headers, json={"product_id": prod_id, "quantity": 3})
+    await client.post("/api/v1/cart/items", headers=c2_headers, json={"product_id": prod_id, "quantity": 3})
+
+    # Fire both orders concurrently
+    req1 = client.post("/api/v1/orders", headers=c1_headers)
+    req2 = client.post("/api/v1/orders", headers=c2_headers)
+
+    res1, res2 = await asyncio.gather(req1, req2)
+    
+    statuses = [res1.status_code, res2.status_code]
+    assert statuses.count(201) == 1, "Exactly one request should succeed"
+    assert statuses.count(409) == 1, "Exactly one request should fail with conflict"
+
+    # Verify inventory state
+    inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
+    assert inv_response.json()["available_quantity"] == 2
+    assert inv_response.json()["reserved_quantity"] == 3
+
+    # Direct database verification using fresh session (the test's db_session)
+    result = await db_session.execute(select(InventoryReservation).where(InventoryReservation.product_id == prod_id))
+    reservations = result.scalars().all()
+    assert len(reservations) == 1
+    assert reservations[0].quantity == 3
+    assert reservations[0].status == ReservationStatus.ACTIVE
+
+
+@pytest.mark.parametrize("run", range(5))
+@pytest.mark.asyncio
+async def test_concurrent_sufficient_stock_success(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User, run: int) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+
+    # Setup Customer 2
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    await client.post("/api/v1/users", headers=admin_headers, json={
+        "email": f"cust2_suff_{run}@example.com", "name": "Cust Two", "password": "Password123!", "role_id": customer_user.role_id
+    })
+    customer2_token = await login_and_get_access_token(client, f"cust2_suff_{run}@example.com", "Password123!")
+
+    cat_id, prod_id, wh_id = await setup_data_unique(client, admin_token)
+
+    # Set inventory exactly to 10
+    await client.post(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
+        "available_quantity_change": 10, "reason": "Restock"
+    })
+
+    # Users add product to cart
+    c1_headers = {"Authorization": f"Bearer {customer_token}"}
+    c2_headers = {"Authorization": f"Bearer {customer2_token}"}
+
+    await client.post("/api/v1/cart/items", headers=c1_headers, json={"product_id": prod_id, "quantity": 3})
+    await client.post("/api/v1/cart/items", headers=c2_headers, json={"product_id": prod_id, "quantity": 4})
+
+    # Fire both orders concurrently
+    req1 = client.post("/api/v1/orders", headers=c1_headers)
+    req2 = client.post("/api/v1/orders", headers=c2_headers)
+
+    res1, res2 = await asyncio.gather(req1, req2)
+    
+    assert res1.status_code == 201
+    assert res2.status_code == 201
+
+    # Verify inventory state
+    inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
+    assert inv_response.json()["available_quantity"] == 3
+    assert inv_response.json()["reserved_quantity"] == 7
+
+    # Direct DB verification
+    result = await db_session.execute(select(InventoryReservation).where(InventoryReservation.product_id == prod_id))
+    reservations = result.scalars().all()
+    assert len(reservations) == 2
+
+
+@pytest.mark.parametrize("run", range(5))
+@pytest.mark.asyncio
+async def test_concurrent_multi_product_deadlock(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User, run: int) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+
+    # Setup Customer 2
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    await client.post("/api/v1/users", headers=admin_headers, json={
+        "email": f"cust2_dl_{run}@example.com", "name": "Cust Two", "password": "Password123!", "role_id": customer_user.role_id
+    })
+    customer2_token = await login_and_get_access_token(client, f"cust2_dl_{run}@example.com", "Password123!")
+
+    suffix = uuid.uuid4().hex[:8]
+    # Create products
+    response = await client.post("/api/v1/categories", headers=admin_headers, json={"name": f"CatRes_{suffix}", "slug": f"catres_{suffix}"})
+    cat_id = cast(int, response.json()["id"])
+    
+    response = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": f"ProdA_{suffix}", "slug": f"proda_{suffix}", "sku": f"SKUA_{suffix}", "price": 10.0, "category_id": cat_id, "is_active": True
+    })
+    prodA_id = cast(int, response.json()["id"])
+
+    response = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": f"ProdB_{suffix}", "slug": f"prodb_{suffix}", "sku": f"SKUB_{suffix}", "price": 10.0, "category_id": cat_id, "is_active": True
+    })
+    prodB_id = cast(int, response.json()["id"])
+
+    response = await client.post("/api/v1/warehouses", headers=admin_headers, json={"code": f"WHA_{suffix}", "name": f"LocA_{suffix}"})
+    wh_id = cast(int, response.json()["id"])
+
+    # Stock both products
+    await client.post(f"/api/v1/inventory/products/{prodA_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
+        "available_quantity_change": 100, "reason": "Restock"
+    })
+    await client.post(f"/api/v1/inventory/products/{prodB_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
+        "available_quantity_change": 100, "reason": "Restock"
+    })
+
+    # C1 cart: A then B
+    c1_headers = {"Authorization": f"Bearer {customer_token}"}
+    await client.post("/api/v1/cart/items", headers=c1_headers, json={"product_id": prodA_id, "quantity": 1})
+    await client.post("/api/v1/cart/items", headers=c1_headers, json={"product_id": prodB_id, "quantity": 1})
+
+    # C2 cart: B then A
+    c2_headers = {"Authorization": f"Bearer {customer2_token}"}
+    await client.post("/api/v1/cart/items", headers=c2_headers, json={"product_id": prodB_id, "quantity": 1})
+    await client.post("/api/v1/cart/items", headers=c2_headers, json={"product_id": prodA_id, "quantity": 1})
+
+    req1 = client.post("/api/v1/orders", headers=c1_headers)
+    req2 = client.post("/api/v1/orders", headers=c2_headers)
+
+    # Use timeout to detect deadlock
+    try:
+        res1, res2 = await asyncio.wait_for(asyncio.gather(req1, req2), timeout=10.0)
+    except asyncio.TimeoutError:
+        pytest.fail("Deadlock detected during concurrent orders!")
+
+    assert res1.status_code == 201
+    assert res2.status_code == 201
