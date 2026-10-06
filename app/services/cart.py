@@ -49,12 +49,7 @@ class CartService:
         cart = await self.get_or_create_cart(user_id)
 
         try:
-            existing_item = await self.cart_repo.get_item_by_cart_and_product(cart.id, product.id)
-            if existing_item:
-                _ = await self.cart_repo.update_item(existing_item, existing_item.quantity + data.quantity)
-            else:
-                _ = await self.cart_repo.add_item(cart.id, product.id, data.quantity)
-            
+            _ = await self.cart_repo.upsert_item(cart.id, data.product_id, data.quantity)
             await self.db.commit()
         except IntegrityError:
             await self.db.rollback()

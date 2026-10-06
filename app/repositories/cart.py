@@ -1,4 +1,5 @@
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -58,6 +59,18 @@ class CartRepository:
         stmt = select(CartItem).options(selectinload(CartItem.product)).where(CartItem.id == item.id)
         result = await self.db.execute(stmt)
         return result.scalar_one()
+
+    async def upsert_item(self, cart_id: int, product_id: int, quantity: int) -> CartItem:
+        stmt = pg_insert(CartItem).values(cart_id=cart_id, product_id=product_id, quantity=quantity)
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_cart_product",
+            set_={"quantity": CartItem.quantity + stmt.excluded.quantity}
+        ).returning(CartItem)
+        
+        result = await self.db.execute(stmt)
+        item = result.scalar_one()
+        await self.db.flush()
+        return item
 
     async def update_item(self, item: CartItem, quantity: int) -> CartItem:
         item.quantity = quantity

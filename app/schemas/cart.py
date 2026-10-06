@@ -32,6 +32,6 @@ class CartRead(BaseModel):
     user_id: int
     created_at: datetime
     updated_at: datetime | None = None
-    items: list[CartItemRead] = []
+    items: list[CartItemRead] = Field(default_factory=list)
 
     model_config: ClassVar[ConfigDict] = ConfigDict(from_attributes=True)

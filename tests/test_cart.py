@@ -158,3 +158,44 @@ async def test_cart_operations(client: AsyncClient, db_session: AsyncSession, ad
     inv = result.scalar_one()
     assert inv.available_quantity == 10
     assert inv.reserved_quantity == 0
+
+
+import asyncio
+
+async def test_cart_concurrent_add(client: AsyncClient, admin_user: User, customer_user: User) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    # Create category & product
+    response = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "CatC", "slug": "catc"})
+    cat_id = cast(int, response.json()["id"])
+
+    response = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "ProdC", "slug": "prodc", "sku": "SKUC", "price": 100.0, "category_id": cat_id, "is_active": True
+    })
+    prod_id = cast(int, response.json()["id"])
+
+    # Make two concurrent requests to add 2 and 3 of the same product
+    async def add_item_req(qty: int):
+        return await client.post("/api/v1/cart/items", headers=customer_headers, json={
+            "product_id": prod_id,
+            "quantity": qty
+        })
+
+    r1, r2 = await asyncio.gather(
+        add_item_req(2),
+        add_item_req(3)
+    )
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+
+    # Verify final state
+    response = await client.get("/api/v1/cart", headers=customer_headers)
+    assert response.status_code == 200
+    cart_data = response.json()
+    assert len(cart_data["items"]) == 1
+    assert cart_data["items"][0]["quantity"] == 5
