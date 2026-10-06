@@ -4,6 +4,10 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
+from datetime import datetime, timezone
+from app.exceptions.inventory import InventoryNotFoundError
+from app.exceptions.inventory_reservation import InvalidReservationStateError
 
 from app.models.user import User
 from app.models.inventory import Inventory
@@ -166,6 +170,7 @@ async def test_reservation_service_methods(client: AsyncClient, db_session: Asyn
     
     # 1. Release Test
     await service.release_reservation(reservation_id)
+    await db_session.commit()
     # Check inventory
     await db_session.refresh(reservations[0])
     assert reservations[0].status == ReservationStatus.RELEASED
@@ -176,6 +181,7 @@ async def test_reservation_service_methods(client: AsyncClient, db_session: Asyn
 
     # Idempotent release
     await service.release_reservation(reservation_id)
+    await db_session.commit()
     inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
     assert inv_response.json()["available_quantity"] == 10
 
@@ -193,12 +199,14 @@ async def test_reservation_service_methods(client: AsyncClient, db_session: Asyn
 
     # Confirm
     await service.confirm_reservation(res2.id)
+    await db_session.commit()
     inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
     assert inv_response.json()["available_quantity"] == 8
     assert inv_response.json()["reserved_quantity"] == 0
 
     # Idempotent confirm
     await service.confirm_reservation(res2.id)
+    await db_session.commit()
     inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
     assert inv_response.json()["reserved_quantity"] == 0
 
@@ -212,6 +220,7 @@ async def test_reservation_service_methods(client: AsyncClient, db_session: Asyn
 
     # Expire
     await service.expire_reservation(res3.id)
+    await db_session.commit()
     inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
     # Available was 8, ordered 1 (so 7), then expired (so 8 again)
     assert inv_response.json()["available_quantity"] == 8
@@ -219,5 +228,115 @@ async def test_reservation_service_methods(client: AsyncClient, db_session: Asyn
 
     # Idempotent expire
     await service.expire_reservation(res3.id)
+    await db_session.commit()
     inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
     assert inv_response.json()["available_quantity"] == 8
+
+@pytest.mark.asyncio
+async def test_duplicate_logical_reservation_blocked(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    cat_id, prod_id, wh_id = await setup_data(client, admin_token)
+    
+    order = Order(user_id=customer_user.id)
+    db_session.add(order)
+    await db_session.commit()
+    await db_session.refresh(order)
+    
+    res1 = InventoryReservation(order_id=order.id, product_id=prod_id, warehouse_id=wh_id, quantity=1, status=ReservationStatus.ACTIVE, expires_at=datetime.now(timezone.utc))
+    db_session.add(res1)
+    await db_session.commit()
+    
+    res2 = InventoryReservation(order_id=order.id, product_id=prod_id, warehouse_id=wh_id, quantity=1, status=ReservationStatus.ACTIVE, expires_at=datetime.now(timezone.utc))
+    db_session.add(res2)
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+    await db_session.rollback()
+
+@pytest.mark.asyncio
+async def test_transition_does_not_commit_unexpectedly(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    cat_id, prod_id, wh_id = await setup_data(client, admin_token)
+    
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    await client.post(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
+        "available_quantity_change": 10, "reason": "Restock"
+    })
+    
+    order = Order(user_id=customer_user.id)
+    db_session.add(order)
+    await db_session.commit()
+    
+    res = InventoryReservation(order_id=order.id, product_id=prod_id, warehouse_id=wh_id, quantity=1, status=ReservationStatus.ACTIVE, expires_at=datetime.now(timezone.utc))
+    db_session.add(res)
+    
+    inventory = await db_session.execute(select(Inventory).where(Inventory.product_id == prod_id))
+    inv_obj = inventory.scalars().first()
+    if inv_obj:
+        inv_obj.reserved_quantity = 1
+        inv_obj.available_quantity = 9
+    await db_session.commit()
+    
+    service = InventoryReservationService(db_session)
+    await service.release_reservation(res.id)
+    
+    await db_session.refresh(res)
+    assert res.status == ReservationStatus.RELEASED
+    
+    res_id = res.id
+    await db_session.rollback()
+    
+    res_again = await db_session.get(InventoryReservation, res_id)
+    assert res_again is not None
+    assert res_again.status == ReservationStatus.ACTIVE
+
+@pytest.mark.asyncio
+async def test_invalid_reserved_quantity_does_not_go_negative(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    cat_id, prod_id, wh_id = await setup_data(client, admin_token)
+    
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    await client.post(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust", headers=admin_headers, json={
+        "available_quantity_change": 10, "reason": "Restock"
+    })
+    
+    order = Order(user_id=customer_user.id)
+    db_session.add(order)
+    await db_session.commit()
+    
+    res = InventoryReservation(order_id=order.id, product_id=prod_id, warehouse_id=wh_id, quantity=5, status=ReservationStatus.ACTIVE, expires_at=datetime.now(timezone.utc))
+    db_session.add(res)
+    
+    inventory = await db_session.execute(select(Inventory).where(Inventory.product_id == prod_id))
+    inv_obj = inventory.scalars().first()
+    if inv_obj:
+        inv_obj.reserved_quantity = 2
+    await db_session.commit()
+    
+    service = InventoryReservationService(db_session)
+    with pytest.raises(InvalidReservationStateError) as exc:
+        await service.release_reservation(res.id)
+    assert "reserved_quantity" in str(exc.value)
+
+@pytest.mark.asyncio
+async def test_missing_inventory_raises_domain_exception(client: AsyncClient, db_session: AsyncSession, admin_user: User, customer_user: User) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    cat_id, prod_id, wh_id = await setup_data(client, admin_token)
+    
+    inventory = await db_session.execute(select(Inventory).where(Inventory.product_id == prod_id))
+    inv_obj = inventory.scalars().first()
+    if inv_obj:
+        await db_session.delete(inv_obj)
+        await db_session.commit()
+        
+    order = Order(user_id=customer_user.id)
+    db_session.add(order)
+    await db_session.commit()
+    
+    res = InventoryReservation(order_id=order.id, product_id=prod_id, warehouse_id=wh_id, quantity=1, status=ReservationStatus.ACTIVE, expires_at=datetime.now(timezone.utc))
+    db_session.add(res)
+    await db_session.commit()
+    
+    service = InventoryReservationService(db_session)
+    with pytest.raises(InventoryNotFoundError) as exc:
+        await service.release_reservation(res.id)
+    assert "Inventory record missing" in str(exc.value)

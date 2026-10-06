@@ -3,6 +3,7 @@ from app.models.inventory_reservation import InventoryReservation, ReservationSt
 from app.repositories.inventory_reservation import InventoryReservationRepository
 from app.repositories.inventory import InventoryRepository
 from app.exceptions.inventory_reservation import ReservationNotFoundError, InvalidReservationStateError
+from app.exceptions.inventory import InventoryNotFoundError
 
 class InventoryReservationService:
     db: AsyncSession
@@ -14,7 +15,7 @@ class InventoryReservationService:
         self.reservation_repo = InventoryReservationRepository(db)
         self.inventory_repo = InventoryRepository(db)
 
-    async def _transition_reservation(self, reservation_id: int, target_status: ReservationStatus) -> InventoryReservation:
+    async def transition_reservation(self, reservation_id: int, target_status: ReservationStatus) -> InventoryReservation:
         reservation = await self.reservation_repo.get_by_id(reservation_id, for_update=True)
         if not reservation:
             raise ReservationNotFoundError(f"Reservation {reservation_id} not found")
@@ -29,40 +30,27 @@ class InventoryReservationService:
             reservation.product_id, reservation.warehouse_id, for_update=True
         )
         if not inventory:
-            raise ValueError("Inventory record missing for reservation")
+            raise InventoryNotFoundError("Inventory record missing for reservation")
 
         if target_status in (ReservationStatus.RELEASED, ReservationStatus.EXPIRED):
+            if inventory.reserved_quantity < reservation.quantity:
+                raise InvalidReservationStateError(f"Cannot release/expire: reserved_quantity ({inventory.reserved_quantity}) < reservation.quantity ({reservation.quantity})")
             inventory.available_quantity += reservation.quantity
             inventory.reserved_quantity -= reservation.quantity
         elif target_status == ReservationStatus.CONFIRMED:
+            if inventory.reserved_quantity < reservation.quantity:
+                raise InvalidReservationStateError(f"Cannot confirm: reserved_quantity ({inventory.reserved_quantity}) < reservation.quantity ({reservation.quantity})")
             inventory.reserved_quantity -= reservation.quantity
             
         reservation.status = target_status
+        await self.db.flush()
         return reservation
 
     async def release_reservation(self, reservation_id: int) -> InventoryReservation:
-        try:
-            reservation = await self._transition_reservation(reservation_id, ReservationStatus.RELEASED)
-            await self.db.commit()
-            return reservation
-        except Exception:
-            await self.db.rollback()
-            raise
+        return await self.transition_reservation(reservation_id, ReservationStatus.RELEASED)
 
     async def confirm_reservation(self, reservation_id: int) -> InventoryReservation:
-        try:
-            reservation = await self._transition_reservation(reservation_id, ReservationStatus.CONFIRMED)
-            await self.db.commit()
-            return reservation
-        except Exception:
-            await self.db.rollback()
-            raise
+        return await self.transition_reservation(reservation_id, ReservationStatus.CONFIRMED)
 
     async def expire_reservation(self, reservation_id: int) -> InventoryReservation:
-        try:
-            reservation = await self._transition_reservation(reservation_id, ReservationStatus.EXPIRED)
-            await self.db.commit()
-            return reservation
-        except Exception:
-            await self.db.rollback()
-            raise
+        return await self.transition_reservation(reservation_id, ReservationStatus.EXPIRED)

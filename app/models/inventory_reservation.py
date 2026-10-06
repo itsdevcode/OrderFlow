@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from enum import Enum as PyEnum
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Enum, func
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Enum, func, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -20,8 +20,14 @@ class ReservationStatus(str, PyEnum):
 
 class InventoryReservation(Base):
     __tablename__: str = "inventory_reservations"
-    __table_args__: tuple[CheckConstraint, ...] = (
+    __table_args__: tuple[CheckConstraint | UniqueConstraint, ...] = (
         CheckConstraint("quantity > 0", name="chk_reservation_quantity_positive"),
+        UniqueConstraint(
+            "order_id",
+            "product_id",
+            "warehouse_id",
+            name="uq_inventory_reservation_order_product_warehouse"
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
