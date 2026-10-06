@@ -3,6 +3,7 @@ import uuid
 from typing import cast
 import pytest
 from httpx import AsyncClient
+from tests.conftest import TestSessionLocal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
@@ -85,22 +86,6 @@ async def test_concurrent_overselling(client: AsyncClient, db_session: AsyncSess
     assert statuses.count(201) == 1, "Exactly one request should succeed"
     assert statuses.count(409) == 1, "Exactly one request should fail with conflict"
 
-    # Verify inventory state
-    inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
-    assert inv_response.json()["available_quantity"] == 0
-    assert inv_response.json()["reserved_quantity"] == 1
-
-    # Verify reservations and orders
-    result = await db_session.execute(select(InventoryReservation).where(InventoryReservation.product_id == prod_id))
-    reservations = result.scalars().all()
-    assert len(reservations) == 1
-    assert reservations[0].quantity == 1
-
-    result = await db_session.execute(select(Order).join(Order.items).where(Order.items.property.mapper.class_.product_id == prod_id))
-    orders = result.unique().scalars().all()
-    assert len(orders) == 1
-
-    # Check losing customer cart
     loser_headers = c1_headers if res1.status_code == 409 else c2_headers
     winner_headers = c1_headers if res1.status_code == 201 else c2_headers
 
@@ -109,6 +94,24 @@ async def test_concurrent_overselling(client: AsyncClient, db_session: AsyncSess
 
     winner_cart = await client.get("/api/v1/cart", headers=winner_headers)
     assert len(winner_cart.json()["items"]) == 0, "Winning customer cart should be cleared"
+
+    async with TestSessionLocal() as verify_session:
+        result = await verify_session.execute(select(Inventory).where(Inventory.product_id == prod_id, Inventory.warehouse_id == wh_id))
+        inv = result.scalars().first()
+        assert inv.available_quantity == 0
+        assert inv.reserved_quantity == 1
+        assert inv.available_quantity >= 0
+        assert inv.reserved_quantity >= 0
+
+        result = await verify_session.execute(select(InventoryReservation).where(InventoryReservation.product_id == prod_id))
+        reservations = result.scalars().all()
+        assert len(reservations) == 1
+        assert reservations[0].quantity == 1
+        assert reservations[0].status == ReservationStatus.ACTIVE
+
+        result = await verify_session.execute(select(Order).join(Order.items).where(Order.items.property.mapper.class_.product_id == prod_id))
+        orders = result.unique().scalars().all()
+        assert len(orders) == 1
 
 
 @pytest.mark.asyncio
@@ -396,17 +399,34 @@ async def test_concurrent_multi_quantity_overselling(client: AsyncClient, db_ses
     assert statuses.count(201) == 1, "Exactly one request should succeed"
     assert statuses.count(409) == 1, "Exactly one request should fail with conflict"
 
-    # Verify inventory state
-    inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
-    assert inv_response.json()["available_quantity"] == 2
-    assert inv_response.json()["reserved_quantity"] == 3
+    loser_headers = c1_headers if res1.status_code == 409 else c2_headers
+    winner_headers = c1_headers if res1.status_code == 201 else c2_headers
 
-    # Direct database verification using fresh session (the test's db_session)
-    result = await db_session.execute(select(InventoryReservation).where(InventoryReservation.product_id == prod_id))
-    reservations = result.scalars().all()
-    assert len(reservations) == 1
-    assert reservations[0].quantity == 3
-    assert reservations[0].status == ReservationStatus.ACTIVE
+    loser_cart = await client.get("/api/v1/cart", headers=loser_headers)
+    assert len(loser_cart.json()["items"]) == 1
+    assert loser_cart.json()["items"][0]["quantity"] == 3
+
+    winner_cart = await client.get("/api/v1/cart", headers=winner_headers)
+    assert len(winner_cart.json()["items"]) == 0
+
+    async with TestSessionLocal() as verify_session:
+        result = await verify_session.execute(select(Inventory).where(Inventory.product_id == prod_id, Inventory.warehouse_id == wh_id))
+        inv = result.scalars().first()
+        assert inv.available_quantity == 2
+        assert inv.reserved_quantity == 3
+        assert inv.available_quantity >= 0
+        assert inv.reserved_quantity >= 0
+
+        result = await verify_session.execute(select(InventoryReservation).where(InventoryReservation.product_id == prod_id))
+        reservations = result.scalars().all()
+        assert len(reservations) == 1
+        assert reservations[0].quantity == 3
+        assert reservations[0].status == ReservationStatus.ACTIVE
+
+        result = await verify_session.execute(select(Order).join(Order.items).where(Order.items.property.mapper.class_.product_id == prod_id))
+        orders = result.unique().scalars().all()
+        assert len(orders) == 1
+
 
 
 @pytest.mark.parametrize("run", range(5))
@@ -445,15 +465,32 @@ async def test_concurrent_sufficient_stock_success(client: AsyncClient, db_sessi
     assert res1.status_code == 201
     assert res2.status_code == 201
 
-    # Verify inventory state
-    inv_response = await client.get(f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}", headers=admin_headers)
-    assert inv_response.json()["available_quantity"] == 3
-    assert inv_response.json()["reserved_quantity"] == 7
+    c1_cart = await client.get("/api/v1/cart", headers=c1_headers)
+    assert len(c1_cart.json()["items"]) == 0
 
-    # Direct DB verification
-    result = await db_session.execute(select(InventoryReservation).where(InventoryReservation.product_id == prod_id))
-    reservations = result.scalars().all()
-    assert len(reservations) == 2
+    c2_cart = await client.get("/api/v1/cart", headers=c2_headers)
+    assert len(c2_cart.json()["items"]) == 0
+
+    async with TestSessionLocal() as verify_session:
+        result = await verify_session.execute(select(Inventory).where(Inventory.product_id == prod_id, Inventory.warehouse_id == wh_id))
+        inv = result.scalars().first()
+        assert inv.available_quantity == 3
+        assert inv.reserved_quantity == 7
+        assert inv.available_quantity >= 0
+        assert inv.reserved_quantity >= 0
+
+        result = await verify_session.execute(select(InventoryReservation).where(InventoryReservation.product_id == prod_id))
+        reservations = result.scalars().all()
+        assert len(reservations) == 2
+        res_quantities = sorted([r.quantity for r in reservations])
+        assert res_quantities == [3, 4]
+        for r in reservations:
+            assert r.status == ReservationStatus.ACTIVE
+
+        result = await verify_session.execute(select(Order).join(Order.items).where(Order.items.property.mapper.class_.product_id == prod_id))
+        orders = result.unique().scalars().all()
+        assert len(orders) == 2
+
 
 
 @pytest.mark.parametrize("run", range(5))
@@ -516,3 +553,29 @@ async def test_concurrent_multi_product_deadlock(client: AsyncClient, db_session
 
     assert res1.status_code == 201
     assert res2.status_code == 201
+
+    c1_cart = await client.get("/api/v1/cart", headers=c1_headers)
+    assert len(c1_cart.json()["items"]) == 0
+    c2_cart = await client.get("/api/v1/cart", headers=c2_headers)
+    assert len(c2_cart.json()["items"]) == 0
+
+    async with TestSessionLocal() as verify_session:
+        result = await verify_session.execute(select(Inventory).where(Inventory.product_id.in_([prodA_id, prodB_id])))
+        inventories = result.scalars().all()
+        assert len(inventories) == 2
+        for inv in inventories:
+            assert inv.available_quantity == 98
+            assert inv.reserved_quantity == 2
+            assert inv.available_quantity >= 0
+            assert inv.reserved_quantity >= 0
+
+        result = await verify_session.execute(select(InventoryReservation).where(InventoryReservation.product_id.in_([prodA_id, prodB_id])))
+        reservations = result.scalars().all()
+        assert len(reservations) == 4
+        for r in reservations:
+            assert r.status == ReservationStatus.ACTIVE
+
+        result = await verify_session.execute(select(Order).join(Order.items).where(Order.items.property.mapper.class_.product_id.in_([prodA_id, prodB_id])))
+        orders = result.unique().scalars().all()
+        assert len(orders) == 2
+
