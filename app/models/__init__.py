@@ -10,6 +10,7 @@ from app.models.cart_item import CartItem
 from app.models.order import Order, OrderStatus
 from app.models.order_item import OrderItem
 from app.models.inventory_reservation import InventoryReservation, ReservationStatus
+from app.models.payment import Payment, PaymentStatus
 
 __all__ = [
     "Category",
@@ -26,4 +27,6 @@ __all__ = [
     "OrderStatus",
     "InventoryReservation",
     "ReservationStatus",
+    "Payment",
+    "PaymentStatus",
 ]
