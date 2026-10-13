@@ -22,6 +22,7 @@ class WebhookEventStatus(str, PyEnum):
     RECEIVED = "RECEIVED"
     PROCESSED = "PROCESSED"
     FAILED = "FAILED"
+    RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
 
 
 class WebhookEvent(Base):

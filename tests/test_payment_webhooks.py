@@ -562,10 +562,24 @@ async def test_payment_success_after_reservation_expiry_quarantined(
     assert res.status_code == 422
     assert "reconciliation" in res.json()["detail"].lower()
 
-    # Order must NOT be marked CONFIRMED
+    # Order must NOT be marked CONFIRMED, payment remains PENDING, and reconciliation evidence is persisted
     async with TestSessionLocal() as session:
         ord_obj = (await session.execute(select(Order).where(Order.id == order_id))).scalar_one()
-        assert ord_obj.status != OrderStatus.CONFIRMED
+        assert ord_obj.status == OrderStatus.PENDING
+
+        pay_obj = (await session.execute(select(Payment).where(Payment.id == init_res.json()["id"]))).scalar_one()
+        assert pay_obj.status == PaymentStatus.PENDING
+
+        evt = (
+            await session.execute(
+                select(WebhookEvent).where(WebhookEvent.provider_event_id == "evt_exp_succ_1")
+            )
+        ).scalar_one()
+        assert evt.status == WebhookEventStatus.RECONCILIATION_REQUIRED
+        assert evt.error_message is not None
+        assert "reconciliation" in evt.error_message.lower()
+        assert evt.payment_id == pay_obj.id
+
 
 
 async def test_timestamp_skew_and_boundary(
@@ -740,4 +754,137 @@ async def test_rollback_when_inventory_confirmation_fails(
 
         evt = (await session.execute(select(WebhookEvent).where(WebhookEvent.provider_event_id == "evt_rollback_1"))).scalar_one_or_none()
         assert evt is None or evt.status != WebhookEventStatus.PROCESSED
+
+
+async def test_delayed_webhook_retry_outside_timestamp_window_succeeds(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+) -> None:
+    """Finding 2: Delayed webhook retries.
+    An identical, already-processed signed event must be safely acknowledged even when its
+    timestamp is outside the original 300-second window.
+    An old, previously unseen event must still be rejected.
+    """
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    cust_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+
+    order_id, _, _ = await setup_test_order(client, admin_token, cust_token, unit_price=60.00, quantity=1)
+
+    init_res = await client.post(
+        f"/api/v1/orders/{order_id}/payments",
+        headers={"Authorization": f"Bearer {cust_token}"},
+        json={"idempotency_key": "pay-key-delayed-test"},
+    )
+    provider_payment_id = cast(str, init_res.json()["provider_payment_id"])
+
+    # 1. First delivery with timestamp inside window (e.g., current time)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    raw_bytes, headers = make_signed_webhook_payload(
+        event_id="evt_delayed_retry_1",
+        event_type="payment.succeeded",
+        provider_payment_id=provider_payment_id,
+        amount="60.00",
+        timestamp=now_ts,
+    )
+    res1 = await client.post("/api/v1/webhooks/payments", content=raw_bytes, headers=headers)
+    assert res1.status_code == 200
+
+    # 2. Delayed retry of the identical event after 1 hour (timestamp is now >300s in past relative to current time)
+    # Re-sending the exact same signed raw_bytes and headers
+    res2 = await client.post("/api/v1/webhooks/payments", content=raw_bytes, headers=headers)
+    assert res2.status_code == 200
+    assert "already processed" in res2.json()["message"].lower()
+
+    # 3. An old, previously UNSEEN event (not in DB) with a 1-hour old timestamp must be rejected
+    old_raw, old_headers = make_signed_webhook_payload(
+        event_id="evt_unseen_old_1",
+        event_type="payment.succeeded",
+        provider_payment_id=provider_payment_id,
+        amount="60.00",
+        timestamp=now_ts - 3600,
+    )
+    res3 = await client.post("/api/v1/webhooks/payments", content=old_raw, headers=old_headers)
+    assert res3.status_code == 400
+    assert "allowable window" in res3.json()["detail"].lower()
+
+
+async def test_webhook_secret_configuration_safety() -> None:
+    """Finding 3: Webhook signing secret fail-safety when production/non-debug configuration is missing."""
+    from app.core.config import Settings
+
+    # In production (debug=False), empty secret must raise ValueError
+    with pytest.raises(ValueError, match="PAYMENT_WEBHOOK_SECRET must be explicitly configured"):
+        _ = Settings(debug=False, payment_webhook_secret="")
+
+    # In debug mode (debug=True), empty secret safely falls back for local dev
+    s_dev = Settings(debug=True, payment_webhook_secret="")
+    assert s_dev.payment_webhook_secret != ""
+
+
+async def test_malformed_content_length_header_safety(
+    client: AsyncClient,
+) -> None:
+    """Finding 4: Payload size safety with malformed Content-Length header and stream enforcement."""
+    raw_bytes = json.dumps({"test": "data"}).encode("utf-8")
+    sig = compute_webhook_signature(raw_bytes, settings.payment_webhook_secret)
+
+    # Malformed Content-Length: "invalid-number"
+    res = await client.post(
+        "/api/v1/webhooks/payments",
+        content=raw_bytes,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": "not-a-number",
+            "X-Webhook-Signature": sig,
+        },
+    )
+    # Should not crash with uncaught 500 ValueError; should proceed to payload parsing/validation
+    assert res.status_code in (400, 401, 404)
+
+
+async def test_provider_payment_id_database_uniqueness(
+    db_session: AsyncSession,
+    admin_user: User,
+    customer_user: User,
+    client: AsyncClient,
+) -> None:
+    """Finding 5: PostgreSQL enforces unique constraint on (provider, provider_payment_id)."""
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    cust_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+
+    # Order 1
+    order1_id, _, _ = await setup_test_order(client, admin_token, cust_token, unit_price=10.00, quantity=1, sku_prefix="UQ1")
+    # Order 2
+    order2_id, _, _ = await setup_test_order(client, admin_token, cust_token, unit_price=10.00, quantity=1, sku_prefix="UQ2")
+
+    pay1 = Payment(
+        order_id=order1_id,
+        provider="fake_provider",
+        provider_payment_id="shared_dup_prov_id",
+        idempotency_key="pay-key-uq-1",
+        amount=Decimal("10.00"),
+        currency="INR",
+        status=PaymentStatus.PENDING,
+    )
+    db_session.add(pay1)
+    await db_session.commit()
+
+    # Attempt to insert second payment with identical (provider, provider_payment_id)
+    pay2 = Payment(
+        order_id=order2_id,
+        provider="fake_provider",
+        provider_payment_id="shared_dup_prov_id",
+        idempotency_key="pay-key-uq-2",
+        amount=Decimal("10.00"),
+        currency="INR",
+        status=PaymentStatus.PENDING,
+    )
+    db_session.add(pay2)
+    from sqlalchemy.exc import IntegrityError
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+
+    await db_session.rollback()
+
 

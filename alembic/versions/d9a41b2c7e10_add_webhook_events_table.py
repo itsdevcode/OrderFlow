@@ -28,7 +28,7 @@ def upgrade() -> None:
         sa.Column('payment_id', sa.Integer(), nullable=True),
         sa.Column(
             'status',
-            sa.Enum('RECEIVED', 'PROCESSED', 'FAILED', name='webhookeventstatus_enum', native_enum=False),
+            sa.Enum('RECEIVED', 'PROCESSED', 'FAILED', 'RECONCILIATION_REQUIRED', name='webhookeventstatus_enum', native_enum=False),
             nullable=False
         ),
         sa.Column('payload_hash', sa.String(length=64), nullable=True),

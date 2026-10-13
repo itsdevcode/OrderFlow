@@ -20,19 +20,34 @@ async def process_payment_webhook(
     db: DbSession,
     x_webhook_signature: str | None = Header(default=None, alias="X-Webhook-Signature"),
 ) -> WebhookResponse:
-    # 1. Enforce payload size limit
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > settings.payment_webhook_max_bytes:
-        raise WebhookPayloadTooLargeError(
-            f"Payload length {content_length} exceeds limit of {settings.payment_webhook_max_bytes} bytes"
-        )
+    # 1. Enforce payload size limit from Content-Length if present and valid
+    content_length_header = request.headers.get("content-length")
+    if content_length_header is not None:
+        try:
+            content_length = int(content_length_header)
+            if content_length > settings.payment_webhook_max_bytes:
+                raise WebhookPayloadTooLargeError(
+                    f"Payload length {content_length} exceeds limit of {settings.payment_webhook_max_bytes} bytes"
+                )
+        except ValueError:
+            # Malformed Content-Length header is ignored here and handled via actual body length check
+            pass
 
-    # 2. Read raw bytes
-    raw_body = await request.body()
-    if len(raw_body) > settings.payment_webhook_max_bytes:
-        raise WebhookPayloadTooLargeError(
-            f"Payload size {len(raw_body)} exceeds limit of {settings.payment_webhook_max_bytes} bytes"
-        )
+    # 2. Read raw bytes up to limit + 1 to prevent unbounded memory consumption
+    body_chunks: list[bytes] = []
+    total_bytes = 0
+    max_bytes = settings.payment_webhook_max_bytes
+
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise WebhookPayloadTooLargeError(
+                f"Payload size exceeds limit of {max_bytes} bytes"
+            )
+        body_chunks.append(chunk)
+
+    raw_body = b"".join(body_chunks)
+
 
     # 3. Process webhook
     service = PaymentWebhookService(db)

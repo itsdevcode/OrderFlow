@@ -77,7 +77,7 @@ class Payment(Base):
         nullable=True,
     )
 
-    __table_args__: tuple = (
+    __table_args__: tuple[CheckConstraint | Index, ...] = (
         CheckConstraint("amount >= 0", name="chk_payment_amount_non_negative"),
         Index(
             "uq_payments_order_id_pending",
@@ -90,6 +90,13 @@ class Payment(Base):
             "order_id",
             unique=True,
             postgresql_where=(status == PaymentStatus.SUCCEEDED),
+        ),
+        Index(
+            "uq_payments_provider_payment_id",
+            "provider",
+            "provider_payment_id",
+            unique=True,
+            postgresql_where=(provider_payment_id.isnot(None)),
         ),
     )
 

@@ -3,12 +3,10 @@ import hashlib
 import hmac
 import json
 import logging
-from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.exceptions.payment import PaymentNotFoundError
@@ -116,18 +114,13 @@ class PaymentWebhookService:
         # 2. Parse & validate payload
         payload = self.parse_payload(raw_body)
 
-        # 3. Timestamp tolerance check (replay window)
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        if abs(now_ts - payload.timestamp) > max_timestamp_skew_seconds:
-            raise WebhookPayloadError(
-                f"Webhook timestamp outside allowable window (diff: {abs(now_ts - payload.timestamp)}s, max: {max_timestamp_skew_seconds}s)"
-            )
-
         payload_hash = hashlib.sha256(raw_body).hexdigest()
         provider = payload.provider
         provider_event_id = payload.event_id
 
-        # 4. Check for existing WebhookEvent (fast path / idempotency)
+        # 3. Check for existing WebhookEvent (fast path / idempotency)
+        # Even if timestamp is outside the allowable window, an already-processed event
+        # with matching payload hash must be safely acknowledged.
         existing_event = await self.webhook_repo.get_by_provider_and_event_id(provider, provider_event_id)
         if existing_event:
             # Check payload consistency: contradictory payload reuse is rejected
@@ -142,6 +135,13 @@ class PaymentWebhookService:
                     event_id=provider_event_id,
                     message="Event already processed",
                 )
+
+        # 4. Timestamp tolerance check (replay window) for previously unseen/unprocessed events
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        if abs(now_ts - payload.timestamp) > max_timestamp_skew_seconds:
+            raise WebhookPayloadError(
+                f"Webhook timestamp outside allowable window (diff: {abs(now_ts - payload.timestamp)}s, max: {max_timestamp_skew_seconds}s)"
+            )
 
         # 5. Execute processing within caller-owned atomic transaction
         try:
@@ -214,7 +214,8 @@ class PaymentWebhookService:
                 f"No payment record found for provider '{provider}' and id '{payload.provider_payment_id}'"
             )
 
-        webhook_event.payment_id = payment.id
+        payment_id = payment.id
+        webhook_event.payment_id = payment_id
 
         # Step B: Validate amount and currency against persisted Payment
         if payment.amount != payload.amount:
@@ -248,25 +249,49 @@ class PaymentWebhookService:
             raise WebhookPayloadError(f"Order {payment.order_id} not found")
 
         # 2. Payment row lock
-        payment_locked = await self.payment_repo.get_by_id_for_update(payment.id)
+        payment_locked = await self.payment_repo.get_by_id_for_update(payment_id)
         if not payment_locked:
             webhook_event.status = WebhookEventStatus.FAILED
-            webhook_event.error_message = f"Payment {payment.id} missing during lock"
+            webhook_event.error_message = f"Payment {payment_id} missing during lock"
             webhook_event.processed_at = datetime.now(timezone.utc)
             await self.db.commit()
-            raise PaymentNotFoundError(f"Payment {payment.id} not found")
+            raise PaymentNotFoundError(f"Payment {payment_id} not found")
 
-        # Handle event types
-        if payload.event_type == "payment.succeeded":
-            await self._handle_payment_succeeded(order, payment_locked, webhook_event)
-        elif payload.event_type == "payment.failed":
-            await self._handle_payment_failed(order, payment_locked, webhook_event)
-        else:
-            webhook_event.status = WebhookEventStatus.FAILED
-            webhook_event.error_message = f"Unsupported event type: {payload.event_type}"
-            webhook_event.processed_at = datetime.now(timezone.utc)
+        # Handle event types with durable reconciliation safety
+        try:
+            if payload.event_type == "payment.succeeded":
+                await self._handle_payment_succeeded(order, payment_locked, webhook_event)
+            elif payload.event_type == "payment.failed":
+                await self._handle_payment_failed(order, payment_locked, webhook_event)
+            else:
+                webhook_event.status = WebhookEventStatus.FAILED
+                webhook_event.error_message = f"Unsupported event type: {payload.event_type}"
+                webhook_event.processed_at = datetime.now(timezone.utc)
+                await self.db.commit()
+                raise WebhookPayloadError(f"Unsupported event type: {payload.event_type}")
+        except WebhookReconciliationRequiredError as recon_exc:
+            # Finding 1: Durable reconciliation
+            # Roll back business mutations (payment, order, inventory) but persist
+            # reconciliation evidence in WebhookEvent for investigation/retry.
+            await self.db.rollback()
+
+            recon_event = await self.webhook_repo.get_by_provider_and_event_id(provider, provider_event_id)
+            if not recon_event:
+                recon_event = WebhookEvent(
+                    provider=provider,
+                    provider_event_id=provider_event_id,
+                    event_type=payload.event_type,
+                    payment_id=payment_id,
+                    payload_hash=payload_hash,
+                )
+                self.db.add(recon_event)
+
+            recon_event.status = WebhookEventStatus.RECONCILIATION_REQUIRED
+            recon_event.error_message = str(recon_exc.detail)
+            recon_event.processed_at = datetime.now(timezone.utc)
             await self.db.commit()
-            raise WebhookPayloadError(f"Unsupported event type: {payload.event_type}")
+            raise
+
 
         # Mark WebhookEvent PROCESSED
         webhook_event.status = WebhookEventStatus.PROCESSED
@@ -281,6 +306,7 @@ class PaymentWebhookService:
             event_id=provider_event_id,
             message="Webhook processed successfully",
         )
+
 
     async def _handle_payment_succeeded(
         self,
