@@ -216,29 +216,21 @@ class PaymentService:
         _ = await self._get_authorized_order(order_id, user, for_update=False)
         return await self.payment_repo.list_by_order_id(order_id)
 
-    async def transition_payment_status(
+    async def apply_payment_transition(
         self,
-        payment_id: int,
+        payment: Payment,
         target_status: PaymentStatus,
     ) -> Payment:
         """
-        Validated state transitions:
-        - PENDING -> SUCCEEDED
-        - PENDING -> FAILED
-        - SUCCEEDED -> REFUNDED
-        Idempotent: Repeating the same valid terminal transition returns payment without duplicating side effects.
+        Validate and apply state transition on payment in-memory without committing.
+        Flushes to session so constraints and changes are reflected in the current transaction.
         """
-        payment = await self.payment_repo.get_by_id_for_update(payment_id)
-        if not payment:
-            raise PaymentNotFoundError(f"Payment with id {payment_id} not found")
-
         current_status = payment.status
 
         # If already in the target status (terminal state idempotency)
         if current_status == target_status:
             return payment
 
-        # Valid transitions mapping
         valid_transitions: dict[PaymentStatus, set[PaymentStatus]] = {
             PaymentStatus.PENDING: {PaymentStatus.SUCCEEDED, PaymentStatus.FAILED},
             PaymentStatus.SUCCEEDED: {PaymentStatus.REFUNDED},
@@ -252,6 +244,32 @@ class PaymentService:
             )
 
         payment.status = target_status
-        await self.db.commit()
-        await self.db.refresh(payment)
+        await self.db.flush()
         return payment
+
+    async def transition_payment_status(
+        self,
+        payment_id: int,
+        target_status: PaymentStatus,
+        *,
+        auto_commit: bool = True,
+    ) -> Payment:
+        """
+        Validated state transitions:
+        - PENDING -> SUCCEEDED
+        - PENDING -> FAILED
+        - SUCCEEDED -> REFUNDED
+        Idempotent: Repeating the same valid terminal transition returns payment without duplicating side effects.
+        """
+        payment = await self.payment_repo.get_by_id_for_update(payment_id)
+        if not payment:
+            raise PaymentNotFoundError(f"Payment with id {payment_id} not found")
+
+        updated_payment = await self.apply_payment_transition(payment, target_status)
+
+        if auto_commit:
+            await self.db.commit()
+            await self.db.refresh(updated_payment)
+
+        return updated_payment
+
