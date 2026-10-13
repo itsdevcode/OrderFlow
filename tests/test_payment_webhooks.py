@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import hmac
@@ -760,16 +760,22 @@ async def test_delayed_webhook_retry_outside_timestamp_window_succeeds(
     client: AsyncClient,
     admin_user: User,
     customer_user: User,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Finding 2: Delayed webhook retries.
-    An identical, already-processed signed event must be safely acknowledged even when its
-    timestamp is outside the original 300-second window.
-    An old, previously unseen event must still be rejected.
+    1. Deliver and process a valid signed webhook at time T.
+    2. Advance the webhook service's clock to T + 3600 seconds using a controlled/frozen clock.
+    3. Replay the exact original signed bytes and signature.
+    4. Assert HTTP 200 and no duplicate inventory effects.
+    5. Submit a different, previously unseen event signed with timestamp T.
+    6. Assert HTTP 400 because its timestamp is outside the allowed window.
+    7. Verify the original WebhookEvent remains PROCESSED and only one record exists.
+    8. Do not use real sleeps.
     """
     admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
     cust_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
 
-    order_id, _, _ = await setup_test_order(client, admin_token, cust_token, unit_price=60.00, quantity=1)
+    order_id, prod_id, wh_id = await setup_test_order(client, admin_token, cust_token, unit_price=60.00, quantity=1)
 
     init_res = await client.post(
         f"/api/v1/orders/{order_id}/payments",
@@ -778,35 +784,88 @@ async def test_delayed_webhook_retry_outside_timestamp_window_succeeds(
     )
     provider_payment_id = cast(str, init_res.json()["provider_payment_id"])
 
-    # 1. First delivery with timestamp inside window (e.g., current time)
-    now_ts = int(datetime.now(timezone.utc).timestamp())
+    # 1. Deliver and process a valid signed webhook at time T
+    t_start = datetime(2026, 10, 13, 12, 0, 0, tzinfo=timezone.utc)
+    t_timestamp = int(t_start.timestamp())
+
+    current_clock = t_start
+
+    def mock_now() -> datetime:
+        return current_clock
+
+    from app.services import payment_webhook
+    monkeypatch.setattr(payment_webhook, "get_current_utc_time", mock_now)
+
     raw_bytes, headers = make_signed_webhook_payload(
         event_id="evt_delayed_retry_1",
         event_type="payment.succeeded",
         provider_payment_id=provider_payment_id,
         amount="60.00",
-        timestamp=now_ts,
+        timestamp=t_timestamp,
     )
     res1 = await client.post("/api/v1/webhooks/payments", content=raw_bytes, headers=headers)
     assert res1.status_code == 200
 
-    # 2. Delayed retry of the identical event after 1 hour (timestamp is now >300s in past relative to current time)
-    # Re-sending the exact same signed raw_bytes and headers
+    # Verify inventory state after first delivery: reserved_quantity is 0
+    async with TestSessionLocal() as session:
+        inv1 = (
+            await session.execute(
+                select(Inventory).where(Inventory.product_id == prod_id, Inventory.warehouse_id == wh_id)
+            )
+        ).scalar_one()
+        assert inv1.reserved_quantity == 0
+        stock_after_first = inv1.available_quantity
+
+    # 2. Advance the webhook service's clock to T + 3600 seconds using controlled clock
+    current_clock = t_start + timedelta(seconds=3600)
+
+    # 3. Replay the exact original signed bytes and signature
     res2 = await client.post("/api/v1/webhooks/payments", content=raw_bytes, headers=headers)
+
+    # 4. Assert HTTP 200 and no duplicate inventory effects
     assert res2.status_code == 200
     assert "already processed" in res2.json()["message"].lower()
 
-    # 3. An old, previously UNSEEN event (not in DB) with a 1-hour old timestamp must be rejected
-    old_raw, old_headers = make_signed_webhook_payload(
-        event_id="evt_unseen_old_1",
+    async with TestSessionLocal() as session:
+        inv2 = (
+            await session.execute(
+                select(Inventory).where(Inventory.product_id == prod_id, Inventory.warehouse_id == wh_id)
+            )
+        ).scalar_one()
+        assert inv2.reserved_quantity == 0
+        assert inv2.available_quantity == stock_after_first  # No duplicate inventory effects
+
+    # 5. Submit a different, previously unseen event signed with timestamp T
+    unseen_raw, unseen_headers = make_signed_webhook_payload(
+        event_id="evt_unseen_at_timestamp_t",
         event_type="payment.succeeded",
         provider_payment_id=provider_payment_id,
         amount="60.00",
-        timestamp=now_ts - 3600,
+        timestamp=t_timestamp,  # Timestamp T is now 3600s in the past relative to advanced clock
     )
-    res3 = await client.post("/api/v1/webhooks/payments", content=old_raw, headers=old_headers)
+    res3 = await client.post("/api/v1/webhooks/payments", content=unseen_raw, headers=unseen_headers)
+
+    # 6. Assert HTTP 400 because its timestamp is outside the allowed window
     assert res3.status_code == 400
     assert "allowable window" in res3.json()["detail"].lower()
+
+    # 7. Verify the original WebhookEvent remains PROCESSED and only one record exists
+    async with TestSessionLocal() as session:
+        evts = (
+            await session.execute(
+                select(WebhookEvent).where(WebhookEvent.provider_event_id == "evt_delayed_retry_1")
+            )
+        ).scalars().all()
+        assert len(evts) == 1
+        assert evts[0].status == WebhookEventStatus.PROCESSED
+
+        unseen_evts = (
+            await session.execute(
+                select(WebhookEvent).where(WebhookEvent.provider_event_id == "evt_unseen_at_timestamp_t")
+            )
+        ).scalars().all()
+        assert len(unseen_evts) == 0
+
 
 
 async def test_webhook_secret_configuration_safety() -> None:

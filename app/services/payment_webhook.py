@@ -16,6 +16,11 @@ from app.exceptions.webhook import (
     WebhookPayloadError,
     WebhookReconciliationRequiredError,
 )
+
+def get_current_utc_time() -> datetime:
+    """Current UTC time helper, patchable for deterministic time-travel in tests."""
+    return datetime.now(timezone.utc)
+
 from app.models.inventory_reservation import ReservationStatus
 from app.models.order import Order, OrderStatus
 from app.models.payment import Payment, PaymentStatus
@@ -137,7 +142,7 @@ class PaymentWebhookService:
                 )
 
         # 4. Timestamp tolerance check (replay window) for previously unseen/unprocessed events
-        now_ts = int(datetime.now(timezone.utc).timestamp())
+        now_ts = int(get_current_utc_time().timestamp())
         if abs(now_ts - payload.timestamp) > max_timestamp_skew_seconds:
             raise WebhookPayloadError(
                 f"Webhook timestamp outside allowable window (diff: {abs(now_ts - payload.timestamp)}s, max: {max_timestamp_skew_seconds}s)"
