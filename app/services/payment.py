@@ -16,6 +16,7 @@ from app.exceptions.payment import (
     PaymentOrderCancelledError,
     PaymentProviderError,
     PendingPaymentExistsError,
+    UnsupportedPaymentProviderError,
 )
 from app.models.order import Order, OrderStatus
 from app.models.payment import Payment, PaymentStatus
@@ -100,6 +101,12 @@ class PaymentService:
         provider_name: str | None = None,
     ) -> Payment:
         chosen_provider = provider_name or self.provider.provider_name
+
+        # Validate that the requested provider matches the configured provider implementation
+        if chosen_provider != self.provider.provider_name:
+            raise UnsupportedPaymentProviderError(
+                f"Unsupported payment provider '{chosen_provider}'. Supported provider: '{self.provider.provider_name}'"
+            )
 
         # Fast path check on idempotency key
         existing_payment = await self.payment_repo.get_by_idempotency_key(idempotency_key)

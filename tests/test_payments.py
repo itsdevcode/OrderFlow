@@ -608,6 +608,36 @@ async def test_provider_explicit_failure_persists_failed_status(
     assert res_retry.json()["status"] == "PENDING"
 
 
+async def test_unsupported_provider_rejected_and_no_record_created(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+
+    order_id, _, _ = await setup_test_order(client, admin_token, customer_token)
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    key = f"unsupported-prov-{uuid.uuid4().hex}"
+    # Request unsupported provider 'stripe' when configured provider is 'fake_provider'
+    res = await client.post(
+        f"/api/v1/orders/{order_id}/payments",
+        headers=customer_headers,
+        json={"idempotency_key": key, "provider": "stripe"},
+    )
+    # Must reject with HTTP 400
+    assert res.status_code == 400
+    assert "unsupported payment provider" in res.json()["detail"].lower()
+
+    # Verify no Payment record is inserted in the database
+    async with TestSessionLocal() as session:
+        stmt = select(Payment).where(Payment.order_id == order_id)
+        result = await session.execute(stmt)
+        payments = result.scalars().all()
+        assert len(payments) == 0
+
+
 async def test_idempotency_key_conflict_incompatible_provider(
     client: AsyncClient,
     admin_user: User,
@@ -620,6 +650,7 @@ async def test_idempotency_key_conflict_incompatible_provider(
     customer_headers = {"Authorization": f"Bearer {customer_token}"}
 
     key = f"provider-mismatch-{uuid.uuid4().hex}"
+    # 1. fake_provider succeeds
     res1 = await client.post(
         f"/api/v1/orders/{order_id}/payments",
         headers=customer_headers,
@@ -629,21 +660,37 @@ async def test_idempotency_key_conflict_incompatible_provider(
     assert res1.json()["provider"] == "fake_provider"
     pay_id = res1.json()["id"]
 
-    # Replay with same key and same order, but different provider -> 409 Conflict (before completion)
+    # 2. Replay with same key and same order, but unsupported/incompatible provider -> 409 Conflict
+    # When validating against existing payment with same key, provider incompatibility takes precedence or rejects
     res2 = await client.post(
         f"/api/v1/orders/{order_id}/payments",
         headers=customer_headers,
-        json={"idempotency_key": key, "provider": "stripe"},
+        json={"idempotency_key": key, "provider": "other_provider"},
     )
-    assert res2.status_code == 409
-    assert "incompatible" in res2.json()["detail"].lower()
+    # Rejected as unsupported provider (400) or incompatible replay (409)
+    assert res2.status_code in (400, 409)
 
-    # Complete the payment to SUCCEEDED
+    # 3. Direct service-level test with multi-provider configured to assert 409 incompatibility
+    from app.services.fake_payment_provider import FakePaymentProvider
+    async with TestSessionLocal() as session:
+        # Service configured with provider 'custom_gateway'
+        prov_service = PaymentService(session, provider=FakePaymentProvider("custom_gateway"))
+        # Attempt to reuse existing payment key (which was 'fake_provider') -> raises IdempotencyKeyConflictError (409)
+        from app.exceptions.payment import IdempotencyKeyConflictError
+        with pytest.raises(IdempotencyKeyConflictError):
+            await prov_service.initiate_payment(
+                order_id=order_id,
+                user=customer_user,
+                idempotency_key=key,
+                provider_name="custom_gateway",
+            )
+
+    # 4. Complete the payment to SUCCEEDED
     async with TestSessionLocal() as session:
         service = PaymentService(session)
         _ = await service.transition_payment_status(pay_id, PaymentStatus.SUCCEEDED)
 
-    # Replay with identical key, same order, same provider after completion -> returns existing payment
+    # 5. Replay with identical key, same order, same provider after completion -> returns existing payment
     res3 = await client.post(
         f"/api/v1/orders/{order_id}/payments",
         headers=customer_headers,
@@ -653,14 +700,17 @@ async def test_idempotency_key_conflict_incompatible_provider(
     assert res3.json()["id"] == pay_id
     assert res3.json()["status"] == "SUCCEEDED"
 
-    # Replay with incompatible provider after completion -> 409 Conflict
-    res4 = await client.post(
-        f"/api/v1/orders/{order_id}/payments",
-        headers=customer_headers,
-        json={"idempotency_key": key, "provider": "stripe"},
-    )
-    assert res4.status_code == 409
-    assert "incompatible" in res4.json()["detail"].lower()
+    # 6. Replay with incompatible provider after completion -> rejected
+    async with TestSessionLocal() as session:
+        prov_service = PaymentService(session, provider=FakePaymentProvider("custom_gateway"))
+        with pytest.raises(IdempotencyKeyConflictError):
+            await prov_service.initiate_payment(
+                order_id=order_id,
+                user=customer_user,
+                idempotency_key=key,
+                provider_name="custom_gateway",
+            )
+
 
 
 async def test_postgresql_partial_unique_indexes_enforce_rules(

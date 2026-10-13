@@ -34,3 +34,9 @@ class InvalidPaymentStateTransitionError(HTTPException):
 class PaymentProviderError(HTTPException):
     def __init__(self, detail: str = "Payment provider processing failed"):
         super().__init__(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
+
+
+class UnsupportedPaymentProviderError(HTTPException):
+    def __init__(self, detail: str = "Unsupported payment provider"):
+        super().__init__(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
