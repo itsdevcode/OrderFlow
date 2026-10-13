@@ -19,3 +19,19 @@ class InventoryReservationRepository:
             stmt = stmt.with_for_update()
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def list_by_order_id(
+        self,
+        order_id: int,
+        *,
+        for_update: bool = False,
+    ) -> list[InventoryReservation]:
+        stmt = (
+            select(InventoryReservation)
+            .where(InventoryReservation.order_id == order_id)
+            .order_by(InventoryReservation.product_id.asc(), InventoryReservation.warehouse_id.asc(), InventoryReservation.id.asc())
+        )
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())

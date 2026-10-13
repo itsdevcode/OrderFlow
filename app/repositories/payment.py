@@ -56,6 +56,34 @@ class PaymentRepository:
         result = await self.db.execute(stmt)
         return result.scalars().all()
 
+    async def get_by_provider_payment_id(
+        self,
+        provider: str,
+        provider_payment_id: str,
+    ) -> Payment | None:
+        stmt = select(Payment).where(
+            Payment.provider == provider,
+            Payment.provider_payment_id == provider_payment_id,
+        )
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_by_provider_payment_id_for_update(
+        self,
+        provider: str,
+        provider_payment_id: str,
+    ) -> Payment | None:
+        stmt = (
+            select(Payment)
+            .where(
+                Payment.provider == provider,
+                Payment.provider_payment_id == provider_payment_id,
+            )
+            .with_for_update()
+        )
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def create(self, payment: Payment) -> Payment:
         self.db.add(payment)
         await self.db.flush()
