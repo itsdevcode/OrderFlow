@@ -660,15 +660,15 @@ async def test_idempotency_key_conflict_incompatible_provider(
     assert res1.json()["provider"] == "fake_provider"
     pay_id = res1.json()["id"]
 
-    # 2. Replay with same key and same order, but unsupported/incompatible provider -> 409 Conflict
-    # When validating against existing payment with same key, provider incompatibility takes precedence or rejects
+    # 2. Replay with same key and same order, but unsupported provider -> 400 Bad Request
     res2 = await client.post(
         f"/api/v1/orders/{order_id}/payments",
         headers=customer_headers,
         json={"idempotency_key": key, "provider": "other_provider"},
     )
-    # Rejected as unsupported provider (400) or incompatible replay (409)
-    assert res2.status_code in (400, 409)
+    # Rejected deterministically as unsupported provider (400)
+    assert res2.status_code == 400
+    assert "unsupported payment provider" in res2.json()["detail"].lower()
 
     # 3. Direct service-level test with multi-provider configured to assert 409 incompatibility
     from app.services.fake_payment_provider import FakePaymentProvider
