@@ -14,6 +14,7 @@ from app.exceptions.payment import (
     PaymentNotFoundError,
     PaymentOrderAlreadyPaidError,
     PaymentOrderCancelledError,
+    PaymentProviderError,
     PendingPaymentExistsError,
 )
 from app.models.order import Order, OrderStatus
@@ -72,6 +73,25 @@ class PaymentService:
             Decimal("0.00"),
         )
 
+    def _validate_idempotency_compatibility(
+        self,
+        payment: Payment,
+        order_id: int,
+        provider_name: str,
+    ) -> None:
+        """
+        Validate that a replayed idempotency key matches the complete compatible request context.
+        If order_id or provider do not match, reject with 409 Conflict.
+        """
+        if payment.order_id != order_id:
+            raise IdempotencyKeyConflictError(
+                f"Idempotency key '{payment.idempotency_key}' is already used for another order"
+            )
+        if payment.provider != provider_name:
+            raise IdempotencyKeyConflictError(
+                f"Idempotency key '{payment.idempotency_key}' was used with provider '{payment.provider}', incompatible with '{provider_name}'"
+            )
+
     async def initiate_payment(
         self,
         order_id: int,
@@ -79,14 +99,13 @@ class PaymentService:
         idempotency_key: str,
         provider_name: str | None = None,
     ) -> Payment:
+        chosen_provider = provider_name or self.provider.provider_name
+
         # Fast path check on idempotency key
         existing_payment = await self.payment_repo.get_by_idempotency_key(idempotency_key)
         if existing_payment:
-            if existing_payment.order_id != order_id:
-                raise IdempotencyKeyConflictError(
-                    f"Idempotency key '{idempotency_key}' is already used for another order"
-                )
-            # Verify user access to the existing order
+            self._validate_idempotency_compatibility(existing_payment, order_id, chosen_provider)
+            # Verify user authorization
             _ = await self._get_authorized_order(order_id, user, for_update=False)
             return existing_payment
 
@@ -105,8 +124,9 @@ class PaymentService:
             # Check if an active PENDING payment already exists
             pending_payment = await self.payment_repo.get_active_pending_by_order_id(order_id)
             if pending_payment:
-                # If key matches, return it
+                # If key matches, validate compatibility and return it
                 if pending_payment.idempotency_key == idempotency_key:
+                    self._validate_idempotency_compatibility(pending_payment, order_id, chosen_provider)
                     return pending_payment
                 raise PendingPaymentExistsError(
                     "A pending payment is already active for this order. Complete or cancel it first."
@@ -115,24 +135,29 @@ class PaymentService:
             # Check again for idempotency key under transaction
             existing_payment = await self.payment_repo.get_by_idempotency_key(idempotency_key)
             if existing_payment:
-                if existing_payment.order_id != order_id:
-                    raise IdempotencyKeyConflictError(
-                        f"Idempotency key '{idempotency_key}' is already used for another order"
-                    )
+                self._validate_idempotency_compatibility(existing_payment, order_id, chosen_provider)
                 return existing_payment
 
             # Derive amount from persisted OrderItems snapshots
             amount = self._calculate_order_amount(order)
             currency = "INR"
-            chosen_provider = provider_name or self.provider.provider_name
 
-            # Call provider initiation
-            provider_result = await self.provider.create_charge(
-                amount=amount,
-                currency=currency,
-                idempotency_key=idempotency_key,
-                order_id=order_id,
-            )
+            # Execute provider charge call with boundary exception handling
+            try:
+                provider_result = await self.provider.create_charge(
+                    amount=amount,
+                    currency=currency,
+                    idempotency_key=idempotency_key,
+                    order_id=order_id,
+                )
+            except Exception as provider_exc:
+                # Sanitized 502 boundary exception; do not leak internal transport details
+                raise PaymentProviderError(
+                    "Payment provider processing failed. Please try again later."
+                ) from provider_exc
+
+            # Check if provider explicitly rejected the attempt (success=False)
+            initial_status = PaymentStatus.PENDING if provider_result.success else PaymentStatus.FAILED
 
             payment = Payment(
                 order_id=order.id,
@@ -141,7 +166,7 @@ class PaymentService:
                 idempotency_key=idempotency_key,
                 amount=amount,
                 currency=currency,
-                status=PaymentStatus.PENDING,
+                status=initial_status,
             )
 
             self.db.add(payment)
@@ -154,16 +179,14 @@ class PaymentService:
             # Handle concurrent race conditions on unique indexes
             existing = await self.payment_repo.get_by_idempotency_key(idempotency_key)
             if existing:
-                if existing.order_id != order_id:
-                    raise IdempotencyKeyConflictError(
-                        f"Idempotency key '{idempotency_key}' is already used for another order"
-                    )
+                self._validate_idempotency_compatibility(existing, order_id, chosen_provider)
                 return existing
 
             # Check if pending payment constraint triggered
             pending = await self.payment_repo.get_active_pending_by_order_id(order_id)
             if pending:
                 if pending.idempotency_key == idempotency_key:
+                    self._validate_idempotency_compatibility(pending, order_id, chosen_provider)
                     return pending
                 raise PendingPaymentExistsError(
                     "A pending payment is already active for this order"

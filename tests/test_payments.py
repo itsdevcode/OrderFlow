@@ -546,12 +546,15 @@ async def test_rollback_on_provider_failure(
 
     # Our FakePaymentProvider raises RuntimeError when key contains 'error'
     error_key = f"key-with-error-{uuid.uuid4().hex}"
-    with pytest.raises(RuntimeError):
-        await client.post(
-            f"/api/v1/orders/{order_id}/payments",
-            headers=customer_headers,
-            json={"idempotency_key": error_key},
-        )
+    res = await client.post(
+        f"/api/v1/orders/{order_id}/payments",
+        headers=customer_headers,
+        json={"idempotency_key": error_key},
+    )
+    assert res.status_code == 502
+    assert "payment provider processing failed" in res.json()["detail"].lower()
+    # Internal error detail should not be exposed to client
+    assert "outage" not in res.json()["detail"].lower()
 
     # Verify with fresh session that no partial payment record was committed
     async with TestSessionLocal() as session:
@@ -559,3 +562,193 @@ async def test_rollback_on_provider_failure(
         result = await session.execute(stmt)
         payments = result.scalars().all()
         assert len(payments) == 0
+
+
+async def test_provider_explicit_failure_persists_failed_status(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+
+    order_id, _, _ = await setup_test_order(client, admin_token, customer_token)
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    # Our FakePaymentProvider returns success=False when key contains 'fail'
+    fail_key = f"key-with-fail-{uuid.uuid4().hex}"
+    res = await client.post(
+        f"/api/v1/orders/{order_id}/payments",
+        headers=customer_headers,
+        json={"idempotency_key": fail_key},
+    )
+    # Payment creation succeeds with status FAILED (not PENDING)
+    assert res.status_code == 201
+    pay_data = res.json()
+    assert pay_data["status"] == "FAILED"
+    assert pay_data["idempotency_key"] == fail_key
+
+    # Verify committed state with a fresh session
+    async with TestSessionLocal() as session:
+        stmt = select(Payment).where(Payment.order_id == order_id)
+        result = await session.execute(stmt)
+        payments = result.scalars().all()
+        assert len(payments) == 1
+        assert payments[0].status == PaymentStatus.FAILED
+
+    # Because the payment is FAILED (and not PENDING or SUCCEEDED),
+    # the customer may retry with a new key on the same order!
+    retry_key = f"retry-key-after-{uuid.uuid4().hex}"
+    res_retry = await client.post(
+        f"/api/v1/orders/{order_id}/payments",
+        headers=customer_headers,
+        json={"idempotency_key": retry_key},
+    )
+    assert res_retry.status_code == 201
+    assert res_retry.json()["status"] == "PENDING"
+
+
+async def test_idempotency_key_conflict_incompatible_provider(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+) -> None:
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+
+    order_id, _, _ = await setup_test_order(client, admin_token, customer_token)
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    key = f"provider-mismatch-{uuid.uuid4().hex}"
+    res1 = await client.post(
+        f"/api/v1/orders/{order_id}/payments",
+        headers=customer_headers,
+        json={"idempotency_key": key, "provider": "fake_provider"},
+    )
+    assert res1.status_code == 201
+    assert res1.json()["provider"] == "fake_provider"
+    pay_id = res1.json()["id"]
+
+    # Replay with same key and same order, but different provider -> 409 Conflict (before completion)
+    res2 = await client.post(
+        f"/api/v1/orders/{order_id}/payments",
+        headers=customer_headers,
+        json={"idempotency_key": key, "provider": "stripe"},
+    )
+    assert res2.status_code == 409
+    assert "incompatible" in res2.json()["detail"].lower()
+
+    # Complete the payment to SUCCEEDED
+    async with TestSessionLocal() as session:
+        service = PaymentService(session)
+        _ = await service.transition_payment_status(pay_id, PaymentStatus.SUCCEEDED)
+
+    # Replay with identical key, same order, same provider after completion -> returns existing payment
+    res3 = await client.post(
+        f"/api/v1/orders/{order_id}/payments",
+        headers=customer_headers,
+        json={"idempotency_key": key, "provider": "fake_provider"},
+    )
+    assert res3.status_code in (200, 201)
+    assert res3.json()["id"] == pay_id
+    assert res3.json()["status"] == "SUCCEEDED"
+
+    # Replay with incompatible provider after completion -> 409 Conflict
+    res4 = await client.post(
+        f"/api/v1/orders/{order_id}/payments",
+        headers=customer_headers,
+        json={"idempotency_key": key, "provider": "stripe"},
+    )
+    assert res4.status_code == 409
+    assert "incompatible" in res4.json()["detail"].lower()
+
+
+async def test_postgresql_partial_unique_indexes_enforce_rules(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+) -> None:
+    """Direct PostgreSQL integration test to verify partial unique index constraints at DB level."""
+    from sqlalchemy.exc import IntegrityError
+
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+    order_id, _, _ = await setup_test_order(client, admin_token, customer_token)
+
+    # 1. Test PENDING partial unique index: cannot insert two PENDING payments for the same order_id
+    async with TestSessionLocal() as session:
+        p1 = Payment(
+            order_id=order_id,
+            provider="prov1",
+            idempotency_key=f"db-uq-pending-1-{uuid.uuid4().hex}",
+            amount=Decimal("100.00"),
+            currency="INR",
+            status=PaymentStatus.PENDING,
+        )
+        session.add(p1)
+        await session.commit()
+
+    async with TestSessionLocal() as session:
+        p2 = Payment(
+            order_id=order_id,
+            provider="prov2",
+            idempotency_key=f"db-uq-pending-2-{uuid.uuid4().hex}",
+            amount=Decimal("100.00"),
+            currency="INR",
+            status=PaymentStatus.PENDING,
+        )
+        session.add(p2)
+        with pytest.raises(IntegrityError) as exc_info:
+            await session.commit()
+        assert "uq_payments_order_id_pending" in str(exc_info.value).lower()
+
+    # 2. Test that multiple FAILED payments for the same order ARE allowed
+    async with TestSessionLocal() as session:
+        # First transition existing PENDING payment to FAILED
+        stmt = select(Payment).where(Payment.id == p1.id)
+        res = await session.execute(stmt)
+        existing = res.scalar_one()
+        existing.status = PaymentStatus.FAILED
+        await session.commit()
+
+    async with TestSessionLocal() as session:
+        p_failed_2 = Payment(
+            order_id=order_id,
+            provider="prov2",
+            idempotency_key=f"db-uq-failed-2-{uuid.uuid4().hex}",
+            amount=Decimal("100.00"),
+            currency="INR",
+            status=PaymentStatus.FAILED,
+        )
+        session.add(p_failed_2)
+        # Should succeed without violating unique index
+        await session.commit()
+
+    # 3. Test SUCCEEDED partial unique index: cannot have two SUCCEEDED payments for the same order_id
+    async with TestSessionLocal() as session:
+        p_succ_1 = Payment(
+            order_id=order_id,
+            provider="prov1",
+            idempotency_key=f"db-uq-succ-1-{uuid.uuid4().hex}",
+            amount=Decimal("100.00"),
+            currency="INR",
+            status=PaymentStatus.SUCCEEDED,
+        )
+        session.add(p_succ_1)
+        await session.commit()
+
+    async with TestSessionLocal() as session:
+        p_succ_2 = Payment(
+            order_id=order_id,
+            provider="prov2",
+            idempotency_key=f"db-uq-succ-2-{uuid.uuid4().hex}",
+            amount=Decimal("100.00"),
+            currency="INR",
+            status=PaymentStatus.SUCCEEDED,
+        )
+        session.add(p_succ_2)
+        with pytest.raises(IntegrityError) as exc_info:
+            await session.commit()
+        assert "uq_payments_order_id_succeeded" in str(exc_info.value).lower()
+
+
