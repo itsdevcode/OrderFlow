@@ -1,3 +1,4 @@
+from fastapi import BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.exceptions.cart import ProductNotActiveError
@@ -22,7 +23,11 @@ class OrderService:
         self.cart_repo = CartRepository(db)
         self.product_repo = ProductRepository(db)
 
-    async def create_order_from_cart(self, user_id: int) -> Order:
+    async def create_order_from_cart(
+        self,
+        user_id: int,
+        background_tasks: BackgroundTasks | None = None,
+    ) -> Order:
         cart = await self.cart_repo.get_by_user_id(user_id)
         if not cart or not cart.items:
             raise EmptyCartError()
@@ -108,8 +113,24 @@ class OrderService:
 
             await self.db.flush()
 
+            from app.models.notification import NotificationType
+            from app.services.notification import NotificationService
+
+            notification_service = NotificationService(self.db)
+            notif = await notification_service.create_pending_notification(
+                user_id=user_id,
+                order_id=new_order.id,
+                order_number=new_order.order_number,
+                notification_type=NotificationType.ORDER_CREATED,
+                deduplication_key=f"order.created:{new_order.id}",
+            )
+
             await self.cart_repo.clear_cart(cart.id)
             await self.db.commit()
+
+            if notif and background_tasks is not None:
+                from app.api.background import dispatch_notification_task
+                background_tasks.add_task(dispatch_notification_task, notif.id)
             
             # Refetch with eager loading for items
             stmt = select(Order).where(Order.id == new_order.id).options(selectinload(Order.items))

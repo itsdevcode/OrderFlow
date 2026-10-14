@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.roles import RoleName
@@ -101,6 +101,7 @@ async def get_shipment(
 async def update_shipment_status(
     shipment_id: int,
     request: ShipmentStatusUpdate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> Any:
     """
@@ -111,6 +112,7 @@ async def update_shipment_status(
     return await service.transition_shipment_status(
         shipment_id=shipment_id,
         update_data=request,
+        background_tasks=background_tasks,
     )
 
 

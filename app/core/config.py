@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 7
     payment_webhook_secret: str = ""
     payment_webhook_max_bytes: int = 65536  # 64 KB
+    notification_max_attempts: int = 3
+    notification_claim_lease_seconds: int = 300  # 5 minutes
     model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

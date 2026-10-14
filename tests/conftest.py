@@ -13,7 +13,7 @@ from sqlalchemy.pool import NullPool
 import app.models  # pyright: ignore[reportUnusedImport]
 from app.db.base import Base
 from app.db.session import get_db
-from app.main import app
+from app.main import app as fastapi_app
 
 from app.core.roles import RoleName
 from app.core.security import hash_password
@@ -48,8 +48,6 @@ async def setup_database() -> AsyncGenerator[None, None]:
     async with test_engine.begin() as connection:
         await connection.run_sync(Base.metadata.drop_all)
 
-    await test_engine.dispose()
-
 
 @pytest_asyncio.fixture
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
@@ -57,6 +55,17 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+
+
+import pytest
+from app.db import session as db_session_module
+
+@pytest.fixture(autouse=True)
+def bind_test_session_local():
+    orig_session_local = db_session_module.AsyncSessionLocal
+    db_session_module.AsyncSessionLocal = TestSessionLocal
+    yield
+    db_session_module.AsyncSessionLocal = orig_session_local
 
 
 @pytest_asyncio.fixture
@@ -68,9 +77,9 @@ async def client(
         async with TestSessionLocal() as session:
             yield session
 
-    app.dependency_overrides[get_db] = override_get_db
+    fastapi_app.dependency_overrides[get_db] = override_get_db
 
-    transport = ASGITransport(app=app)
+    transport = ASGITransport(app=fastapi_app)
 
     async with AsyncClient(
         transport=transport,
@@ -78,7 +87,7 @@ async def client(
     ) as test_client:
         yield test_client
 
-    app.dependency_overrides.clear()
+    fastapi_app.dependency_overrides.clear()
 
 @pytest_asyncio.fixture
 async def admin_user(db_session: AsyncSession) -> User:

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Header, Request, status
+from fastapi import APIRouter, BackgroundTasks, Header, Request, status
 from app.core.config import settings
 from app.dependencies.database import DbSession
 from app.exceptions.webhook import WebhookPayloadTooLargeError
@@ -18,6 +18,7 @@ router = APIRouter(prefix="/webhooks/payments", tags=["Webhooks"])
 async def process_payment_webhook(
     request: Request,
     db: DbSession,
+    background_tasks: BackgroundTasks,
     x_webhook_signature: str | None = Header(default=None, alias="X-Webhook-Signature"),
 ) -> WebhookResponse:
     # 1. Enforce payload size limit from Content-Length if present and valid
@@ -54,4 +55,5 @@ async def process_payment_webhook(
     return await service.process_webhook(
         raw_body=raw_body,
         signature_header=x_webhook_signature,
+        background_tasks=background_tasks,
     )

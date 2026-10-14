@@ -13,6 +13,12 @@ from app.models.inventory_reservation import InventoryReservation, ReservationSt
 from app.models.payment import Payment, PaymentStatus
 from app.models.webhook_event import WebhookEvent, WebhookEventStatus
 from app.models.shipment import Shipment, ShipmentStatus
+from app.models.notification import (
+    Notification,
+    NotificationStatus,
+    NotificationType,
+    NotificationChannel,
+)
 
 __all__ = [
     "Category",
@@ -35,4 +41,8 @@ __all__ = [
     "WebhookEventStatus",
     "Shipment",
     "ShipmentStatus",
+    "Notification",
+    "NotificationStatus",
+    "NotificationType",
+    "NotificationChannel",
 ]
