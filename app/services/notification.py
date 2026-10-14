@@ -111,6 +111,16 @@ class NotificationService:
         2. Phase 2 (Non-Transactional): Deliver via delivery adapter OUTSIDE database transaction.
         3. Phase 3 (Short Transaction): Finalize outcome (SENT or FAILED) with claim_token fencing
            and sanitized error category recording.
+
+        Recovery & Scheduling Architecture:
+        - When a worker claims a notification, it acquires a lease for `notification_claim_lease_seconds`.
+        - If the worker crashes or hangs during Phase 2 delivery, the notification remains in PROCESSING
+          until the lease expires.
+        - Lease-based recovery requires a future scheduler (e.g., cron job / periodic background worker)
+          or an explicit redispatch mechanism (e.g., operational retry sweep or re-queue endpoint) to
+          query for expired PROCESSING / eligible FAILED notifications and trigger `dispatch_notification`.
+        - No heavyweight external queue system (e.g. Celery, RabbitMQ, SQS) is required or introduced
+          in this service; PostgreSQL row locks and lease timeouts provide atomic coordination.
         """
         claim_token = uuid.uuid4().hex
         now = datetime.now(timezone.utc)

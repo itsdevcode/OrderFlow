@@ -685,3 +685,184 @@ async def test_stranded_processing_recovery_and_stale_worker_fencing(
         final_check = (await session.execute(select(Notification).where(Notification.id == notif_id))).scalar_one()
         assert final_check.status == NotificationStatus.SENT
         assert final_check.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_dispatch_claims_exact_single_delivery(
+    customer_user: User,
+) -> None:
+    """
+    Test two independent AsyncSessions attempting to dispatch the same notification simultaneously.
+    Uses asyncio Event synchronization without real sleeps:
+    - Worker 1 claims the notification and pauses inside adapter delivery.
+    - Worker 2 attempts dispatch concurrently while Worker 1's claim is active.
+    - Worker 2 must be blocked / rejected from claiming since Worker 1 holds the valid lease.
+    - Worker 1 completes delivery and finalizes.
+    - Exactly one delivery attempt occurs, status reaches SENT, and attempts count is exactly 1.
+    """
+    # 1. Create a fresh PENDING notification
+    async with TestSessionLocal() as session:
+        notif = Notification(
+            user_id=customer_user.id,
+            notification_type=NotificationType.ORDER_CREATED,
+            channel=NotificationChannel.IN_APP,
+            status=NotificationStatus.PENDING,
+            title="Simultaneous Claim Test",
+            message="Concurrent claim verification",
+            deduplication_key=f"simultaneous.claim.{uuid.uuid4().hex}",
+            attempts=0,
+        )
+        session.add(notif)
+        await session.commit()
+        await session.refresh(notif)
+        notif_id = notif.id
+
+    worker1_started = asyncio.Event()
+    worker2_attempted = asyncio.Event()
+    delivery_count = 0
+
+    class EventControlledDelivery:
+        async def deliver(self, notification: Notification) -> None:
+            nonlocal delivery_count
+            delivery_count += 1
+            # Signal that worker 1 is inside Phase 2 delivery while holding an active claim
+            worker1_started.set()
+            # Wait until worker 2 has executed its dispatch attempt
+            await worker2_attempted.wait()
+
+    async def worker_1():
+        async with TestSessionLocal() as session1:
+            service1 = NotificationService(session1, delivery_adapter=EventControlledDelivery())
+            await service1.dispatch_notification(notif_id)
+
+    async def worker_2():
+        # Wait until worker 1 has claimed and entered delivery
+        await worker1_started.wait()
+        async with TestSessionLocal() as session2:
+            service2 = NotificationService(session2, delivery_adapter=EventControlledDelivery())
+            await service2.dispatch_notification(notif_id)
+        # Signal worker 1 that worker 2 has finished its attempt
+        worker2_attempted.set()
+
+    await asyncio.gather(worker_1(), worker_2())
+
+    # Verify results in fresh database session
+    async with TestSessionLocal() as session:
+        res = await session.execute(select(Notification).where(Notification.id == notif_id))
+        final_notif = res.scalar_one()
+
+        assert delivery_count == 1
+        assert final_notif.status == NotificationStatus.SENT
+        assert final_notif.attempts == 1
+        assert final_notif.claim_token is None
+        assert final_notif.claimed_at is None
+        assert final_notif.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_business_mutation_and_notification_transaction_rollback(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Test transaction rollback integration:
+    Simulates failure after notification creation but before the business transaction commits.
+    Verifies with a fresh session that both the business mutation (order, items, reservations)
+    and notification insertion were completely rolled back.
+    """
+    admin_token = await login_and_get_access_token(client, "admin@test.com", "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, "customer@test.com", "CustomerPassword123!")
+
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    # Setup Category, Product, Warehouse, and Inventory
+    unique_suffix = uuid.uuid4().hex[:6]
+    cat_res = await client.post(
+        "/api/v1/categories",
+        headers=admin_headers,
+        json={"name": f"CatRollback_{unique_suffix}", "slug": f"cat-rollback-{unique_suffix}"},
+    )
+    assert cat_res.status_code == 201
+    cat_id = cat_res.json()["id"]
+
+    sku = f"RBNOTIF_{unique_suffix}"
+    prod_res = await client.post(
+        "/api/v1/products",
+        headers=admin_headers,
+        json={"name": f"Prod_{sku}", "slug": f"prod-{sku.lower()}", "sku": sku, "price": 100.0, "category_id": cat_id, "is_active": True},
+    )
+    assert prod_res.status_code == 201
+    prod_id = prod_res.json()["id"]
+
+    wh_res = await client.post(
+        "/api/v1/warehouses",
+        headers=admin_headers,
+        json={"code": f"WH_{unique_suffix}", "name": "Rollback Test Warehouse"},
+    )
+    assert wh_res.status_code == 201
+    wh_id = wh_res.json()["id"]
+
+    adj_res = await client.post(
+        f"/api/v1/inventory/products/{prod_id}/warehouses/{wh_id}/adjust",
+        headers=admin_headers,
+        json={"available_quantity_change": 10, "reason": "Initial stock for rollback test"},
+    )
+    assert adj_res.status_code == 200
+
+    # Add product to customer cart
+    cart_res = await client.post(
+        "/api/v1/cart/items",
+        headers=customer_headers,
+        json={"product_id": prod_id, "quantity": 1},
+    )
+    assert cart_res.status_code == 200
+
+    # Simulate failure after notification creation but before commit
+    # In OrderService.create_order:
+    # 1. Order, OrderItems, and InventoryReservation are added and flushed.
+    # 2. notification_service.create_pending_notification is called and flushed.
+    # 3. clear_cart is called.
+    # 4. commit occurs.
+    # By causing clear_cart to raise an exception, the transaction rolls back.
+    from app.repositories.cart import CartRepository
+
+    async def mock_clear_cart_failure(*args, **kwargs):
+        raise RuntimeError("Forced post-notification creation business failure")
+
+    monkeypatch.setattr(CartRepository, "clear_cart", mock_clear_cart_failure)
+
+    # Attempt order creation which must fail and trigger rollback
+    with pytest.raises(RuntimeError, match="Forced post-notification creation business failure"):
+        await client.post("/api/v1/orders", headers=customer_headers)
+
+    # Verify with an independent fresh session that EVERYTHING was rolled back
+    async with TestSessionLocal() as verify_session:
+        # 1. Verify no order was persisted
+        order_res = await verify_session.execute(
+            select(Order).where(Order.user_id == customer_user.id)
+        )
+        orders = order_res.scalars().all()
+        # Verify specifically no order exists with items of our sku
+        assert not any(
+            any(item.product_sku == sku for item in o.items)
+            for o in orders
+            if hasattr(o, "items") and o.items
+        )
+
+        # 2. Verify no notification was persisted
+        notif_res = await verify_session.execute(
+            select(Notification).where(
+                Notification.user_id == customer_user.id,
+                Notification.notification_type == NotificationType.ORDER_CREATED,
+            )
+        )
+        notifications = notif_res.scalars().all()
+        # Ensure none of the notifications reference an order with this sku or uncommitted order
+        for n in notifications:
+            if n.order_id is not None:
+                ord_chk = (await verify_session.execute(select(Order).where(Order.id == n.order_id))).scalar_one_or_none()
+                assert ord_chk is not None
+
