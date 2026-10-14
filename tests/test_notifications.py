@@ -768,10 +768,20 @@ async def test_business_mutation_and_notification_transaction_rollback(
 ) -> None:
     """
     Test transaction rollback integration:
-    Simulates failure after notification creation but before the business transaction commits.
-    Verifies with a fresh session that both the business mutation (order, items, reservations)
-    and notification insertion were completely rolled back.
+    1. Capture existing order, notification, and inventory-reservation IDs before the failing operation.
+    2. Force failure after notification creation but before the business transaction commits.
+    3. Using a fresh PostgreSQL session, verify:
+       - No new order was committed.
+       - No new notification was committed.
+       - No new reservation was committed.
+       - Inventory quantities are unchanged.
+       - Customer cart contents are preserved.
+    4. Avoids lazy loading; uses explicit queries without lazy relationship access.
+    5. Fails deterministically if any notification or business entity were mistakenly committed.
     """
+    from app.models.inventory import Inventory
+    from app.models.inventory_reservation import InventoryReservation
+
     admin_token = await login_and_get_access_token(client, "admin@test.com", "AdminPassword123!")
     customer_token = await login_and_get_access_token(client, "customer@test.com", "CustomerPassword123!")
 
@@ -820,7 +830,29 @@ async def test_business_mutation_and_notification_transaction_rollback(
     )
     assert cart_res.status_code == 200
 
-    # Simulate failure after notification creation but before commit
+    # 1. Capture existing order, notification, and inventory-reservation IDs before the operation
+    async with TestSessionLocal() as prep_session:
+        orders_before = (await prep_session.execute(select(Order.id))).scalars().all()
+        existing_order_ids = set(orders_before)
+
+        notifs_before = (await prep_session.execute(select(Notification.id))).scalars().all()
+        existing_notification_ids = set(notifs_before)
+
+        res_before = (await prep_session.execute(select(InventoryReservation.id))).scalars().all()
+        existing_reservation_ids = set(res_before)
+
+        inv_before = (
+            await prep_session.execute(
+                select(Inventory).where(
+                    Inventory.product_id == prod_id,
+                    Inventory.warehouse_id == wh_id,
+                )
+            )
+        ).scalar_one()
+        initial_available_qty = inv_before.available_quantity
+        initial_reserved_qty = inv_before.reserved_quantity
+
+    # 2. Simulate failure after notification creation but before business transaction commit
     # In OrderService.create_order:
     # 1. Order, OrderItems, and InventoryReservation are added and flushed.
     # 2. notification_service.create_pending_notification is called and flushed.
@@ -829,7 +861,7 @@ async def test_business_mutation_and_notification_transaction_rollback(
     # By causing clear_cart to raise an exception, the transaction rolls back.
     from app.repositories.cart import CartRepository
 
-    async def mock_clear_cart_failure(*args, **kwargs):
+    async def mock_clear_cart_failure(*args: object, **kwargs: object) -> None:
         raise RuntimeError("Forced post-notification creation business failure")
 
     monkeypatch.setattr(CartRepository, "clear_cart", mock_clear_cart_failure)
@@ -838,31 +870,44 @@ async def test_business_mutation_and_notification_transaction_rollback(
     with pytest.raises(RuntimeError, match="Forced post-notification creation business failure"):
         await client.post("/api/v1/orders", headers=customer_headers)
 
-    # Verify with an independent fresh session that EVERYTHING was rolled back
+    # 3. Using a fresh PostgreSQL session, verify complete atomicity & no leaked rows
     async with TestSessionLocal() as verify_session:
-        # 1. Verify no order was persisted
-        order_res = await verify_session.execute(
-            select(Order).where(Order.user_id == customer_user.id)
-        )
-        orders = order_res.scalars().all()
-        # Verify specifically no order exists with items of our sku
-        assert not any(
-            any(item.product_sku == sku for item in o.items)
-            for o in orders
-            if hasattr(o, "items") and o.items
+        # Verify no new order was committed
+        orders_after = (await verify_session.execute(select(Order.id))).scalars().all()
+        new_order_ids = set(orders_after) - existing_order_ids
+        assert new_order_ids == set(), f"Unexpected new orders committed: {new_order_ids}"
+
+        # Verify no new notification was committed
+        notifs_after = (await verify_session.execute(select(Notification.id))).scalars().all()
+        new_notification_ids = set(notifs_after) - existing_notification_ids
+        assert new_notification_ids == set(), (
+            f"Unexpected new notifications committed: {new_notification_ids}"
         )
 
-        # 2. Verify no notification was persisted
-        notif_res = await verify_session.execute(
-            select(Notification).where(
-                Notification.user_id == customer_user.id,
-                Notification.notification_type == NotificationType.ORDER_CREATED,
-            )
+        # Verify no new reservation was committed
+        res_after = (await verify_session.execute(select(InventoryReservation.id))).scalars().all()
+        new_reservation_ids = set(res_after) - existing_reservation_ids
+        assert new_reservation_ids == set(), (
+            f"Unexpected new inventory reservations committed: {new_reservation_ids}"
         )
-        notifications = notif_res.scalars().all()
-        # Ensure none of the notifications reference an order with this sku or uncommitted order
-        for n in notifications:
-            if n.order_id is not None:
-                ord_chk = (await verify_session.execute(select(Order).where(Order.id == n.order_id))).scalar_one_or_none()
-                assert ord_chk is not None
+
+        # Verify inventory quantities are unchanged
+        inv_after = (
+            await verify_session.execute(
+                select(Inventory).where(
+                    Inventory.product_id == prod_id,
+                    Inventory.warehouse_id == wh_id,
+                )
+            )
+        ).scalar_one()
+        assert inv_after.available_quantity == initial_available_qty
+        assert inv_after.reserved_quantity == initial_reserved_qty
+
+    # Verify customer cart contents are preserved
+    cart_check_res = await client.get("/api/v1/cart", headers=customer_headers)
+    assert cart_check_res.status_code == 200
+    cart_data = cart_check_res.json()
+    assert len(cart_data["items"]) == 1
+    assert cart_data["items"][0]["product_id"] == prod_id
+    assert cart_data["items"][0]["quantity"] == 1
 
