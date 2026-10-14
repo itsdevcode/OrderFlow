@@ -138,6 +138,64 @@ Once the server is running, you can access the interactive API docs:
 | `GET` | `/health` | Basic application health check |
 | `GET` | `/health/db` | Database connection health check |
 | `POST` | `/api/v1/users` | Register a new user |
+| `POST` | `/api/v1/orders/{order_id}/shipments` | Create shipment for confirmed, paid order (ADMIN/MANAGER) |
+| `GET` | `/api/v1/orders/{order_id}/shipments` | Get shipment for order (ADMIN/MANAGER or order owner) |
+| `GET` | `/api/v1/shipments/{shipment_id}` | Get shipment details (ADMIN/MANAGER or order owner) |
+| `PATCH` | `/api/v1/shipments/{shipment_id}/status` | Update shipment lifecycle status (ADMIN/MANAGER) |
+| `GET` | `/api/v1/shipments` | List shipments with pagination and status filter (ADMIN/MANAGER) |
+
+---
+
+## 📦 Shipment Module Architecture
+
+### Shipment State Lifecycle
+
+```text
+[ Order CONFIRMED & Paid ]
+           │
+           ▼
+       (PENDING)
+       │       │
+       │       └───► (CANCELLED)  [Terminal]
+       ▼
+   (SHIPPED)  [Requires carrier & tracking_number]
+       │
+       ▼
+  (DELIVERED)  [Terminal]
+```
+
+- **Allowed transitions**:
+  - `PENDING -> SHIPPED` (requires non-empty `carrier` and `tracking_number`)
+  - `PENDING -> CANCELLED`
+  - `SHIPPED -> DELIVERED` (preserves `carrier` and `tracking_number`)
+- **Terminal states**: `DELIVERED`, `CANCELLED` (no further transitions allowed).
+- **Idempotency**: Repeated requests targeting current state are idempotent when compatible with existing shipment details; incompatible replayed updates return `409 Conflict`.
+
+### RBAC Authorization
+
+| Action | ADMIN | MANAGER | CUSTOMER |
+|---|:---:|:---:|:---:|
+| Create shipment (`POST /api/v1/orders/{order_id}/shipments`) | ✅ | ✅ | ❌ (403) |
+| Update shipment status (`PATCH /api/v1/shipments/{id}/status`) | ✅ | ✅ | ❌ (403) |
+| List all shipments (`GET /api/v1/shipments`) | ✅ | ✅ | ❌ (403) |
+| View shipment (`GET /orders/{id}/shipments` or `/shipments/{id}`) | ✅ | ✅ | ✅ (Own orders only, non-owned 404) |
+
+### Concurrency and Integrity Strategy
+
+1. **Row-Level Locking**:
+   - Order row is locked with `SELECT ... FOR UPDATE` before shipment creation to prevent race conditions.
+   - Shipment row is locked with `SELECT ... FOR UPDATE` during status transitions to prevent concurrent lost updates.
+2. **Database Constraints**:
+   - Unique constraint on `order_id` enforces strictly one shipment per order at the database level.
+   - PostgreSQL partial unique index on `(carrier, tracking_number)` where both are non-null ensures no duplicate tracking identifiers within the same carrier.
+3. **Transactional Isolation**:
+   - Shipment operations never modify order status, payment status, or inventory reservation quantities.
+   - All failures explicitly roll back database transactions.
+
+### Limitations
+
+- No physical shipping carrier gateway API integration or label printing in this release.
+- Shipments are created via explicit authorized staff action rather than automated event hooks.
 
 ---
 
