@@ -497,7 +497,7 @@ async def test_delivery_lifecycle_and_failure_recording(
         assert failed_notif.status == NotificationStatus.FAILED
         assert failed_notif.attempts == 1
         assert failed_notif.error_message is not None
-        assert "Simulated in-app notification delivery failure" in failed_notif.error_message
+        assert failed_notif.error_message == "SIMULATED_FAILURE"
         assert failed_notif.sent_at is None
 
     # 3. Retry dispatch with succeeding adapter
@@ -527,3 +527,161 @@ async def test_delivery_lifecycle_and_failure_recording(
         ).scalar_one()
         assert final_notif.status == NotificationStatus.SENT
         assert final_notif.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_max_attempts_enforcement_prevents_redispatch(
+    customer_user: User,
+) -> None:
+    # 1. Create a notification with attempts=2 and max_attempts=3
+    async with TestSessionLocal() as session:
+        notif = Notification(
+            user_id=customer_user.id,
+            notification_type=NotificationType.ORDER_CREATED,
+            channel=NotificationChannel.IN_APP,
+            status=NotificationStatus.FAILED,
+            title="Max Attempts Test",
+            message="Test message",
+            deduplication_key=f"max.attempt.{uuid.uuid4().hex}",
+            attempts=2,
+        )
+        session.add(notif)
+        await session.commit()
+        await session.refresh(notif)
+        notif_id = notif.id
+
+    failing_adapter = InAppNotificationDelivery(should_fail=True)
+
+    # Dispatch attempt #3 (reaches max_attempts)
+    async with TestSessionLocal() as session:
+        service = NotificationService(session, delivery_adapter=failing_adapter, max_attempts=3)
+        await service.dispatch_notification(notif_id)
+
+    async with TestSessionLocal() as session:
+        n = (await session.execute(select(Notification).where(Notification.id == notif_id))).scalar_one()
+        assert n.status == NotificationStatus.FAILED
+        assert n.attempts == 3
+
+    # Dispatch attempt #4 (should be refused/blocked by max_attempts)
+    succeeding_adapter = InAppNotificationDelivery(should_fail=False)
+    async with TestSessionLocal() as session:
+        service = NotificationService(session, delivery_adapter=succeeding_adapter, max_attempts=3)
+        await service.dispatch_notification(notif_id)
+
+    # Status remains FAILED and attempts remains 3 (exhausted notifications cannot be claimed automatically)
+    async with TestSessionLocal() as session:
+        n = (await session.execute(select(Notification).where(Notification.id == notif_id))).scalar_one()
+        assert n.status == NotificationStatus.FAILED
+        assert n.attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_secret_leakage_sanitization(
+    customer_user: User,
+) -> None:
+    class LeakyAdapter:
+        async def deliver(self, notification: Notification) -> None:
+            _ = notification
+            # Simulate a third-party error leaking secrets or tokens
+            raise RuntimeError(
+                "API Connection to provider failed: Authorization Bearer sk_live_998877665544332211, "
+                "recipient user@secret.domain, password secret_db_pass"
+            )
+
+    async with TestSessionLocal() as session:
+        notif = Notification(
+            user_id=customer_user.id,
+            notification_type=NotificationType.PAYMENT_FAILED,
+            channel=NotificationChannel.IN_APP,
+            status=NotificationStatus.PENDING,
+            title="Security Test",
+            message="Order message",
+            deduplication_key=f"leak.test.{uuid.uuid4().hex}",
+            attempts=0,
+        )
+        session.add(notif)
+        await session.commit()
+        await session.refresh(notif)
+        notif_id = notif.id
+
+    async with TestSessionLocal() as session:
+        service = NotificationService(session, delivery_adapter=LeakyAdapter())
+        await service.dispatch_notification(notif_id)
+
+    async with TestSessionLocal() as session:
+        n = (await session.execute(select(Notification).where(Notification.id == notif_id))).scalar_one()
+        assert n.status == NotificationStatus.FAILED
+        assert n.error_message is not None
+        # Assert none of the sensitive tokens leaked into the database record
+        assert "sk_live" not in n.error_message
+        assert "Bearer" not in n.error_message
+        assert "secret" not in n.error_message
+        assert "password" not in n.error_message
+        # Instead, sanitized category is saved
+        assert n.error_message in ("AUTHENTICATION_ERROR", "CONNECTION_ERROR", "UNEXPECTED_DELIVERY_ERROR")
+
+
+@pytest.mark.asyncio
+async def test_stranded_processing_recovery_and_stale_worker_fencing(
+    customer_user: User,
+) -> None:
+    from datetime import timedelta, timezone
+    from datetime import datetime
+
+    # 1. Create a notification stranded in PROCESSING with an old claimed_at
+    past_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+    async with TestSessionLocal() as session:
+        notif = Notification(
+            user_id=customer_user.id,
+            notification_type=NotificationType.ORDER_CREATED,
+            channel=NotificationChannel.IN_APP,
+            status=NotificationStatus.PROCESSING,
+            title="Stranded Recovery Test",
+            message="Test message",
+            deduplication_key=f"stranded.test.{uuid.uuid4().hex}",
+            attempts=1,
+            claim_token="stale-worker-claim-token-12345",
+            claimed_at=past_time,
+        )
+        session.add(notif)
+        await session.commit()
+        await session.refresh(notif)
+        notif_id = notif.id
+
+    # 2. Worker 2 attempts dispatch (lease_seconds=300s, elapsed=600s -> recovery kicks in)
+    succeeding_adapter = InAppNotificationDelivery(should_fail=False)
+    async with TestSessionLocal() as session:
+        service = NotificationService(
+            session,
+            delivery_adapter=succeeding_adapter,
+            max_attempts=3,
+            lease_seconds=300,
+        )
+        await service.dispatch_notification(notif_id)
+
+    # Verify notification successfully recovered and moved to SENT
+    async with TestSessionLocal() as session:
+        n = (await session.execute(select(Notification).where(Notification.id == notif_id))).scalar_one()
+        assert n.status == NotificationStatus.SENT
+        assert n.attempts == 2
+        assert n.sent_at is not None
+
+    # 3. Stale Worker 1 wakes up and tries to finalize with old claim token
+    async with TestSessionLocal() as session:
+        repo = NotificationService(session).notification_repo
+        finalized = await repo.finalize_dispatch(
+            notification_id=notif_id,
+            claim_token="stale-worker-claim-token-12345",
+            success=False,
+            now=datetime.now(timezone.utc),
+            sanitized_error="STALE_FAILURE",
+        )
+        await session.commit()
+        # Fencing mechanism blocks the stale worker
+        assert finalized is False
+
+    # Verify status in DB remains SENT and was NOT overwritten to FAILED
+    async with TestSessionLocal() as session:
+        final_check = (await session.execute(select(Notification).where(Notification.id == notif_id))).scalar_one()
+        assert final_check.status == NotificationStatus.SENT
+        assert final_check.error_message is None

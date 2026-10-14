@@ -89,6 +89,14 @@ class Notification(Base):
         nullable=False,
         default=0,
     )
+    claim_token: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     error_message: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,

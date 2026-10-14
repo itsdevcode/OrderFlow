@@ -13,10 +13,12 @@ from app.models.notification import (
     NotificationType,
 )
 from app.repositories.notification import NotificationRepository
+import uuid
+from app.core.config import settings
 from app.services.notification_delivery import (
     InAppNotificationDelivery,
     NotificationDelivery,
-    NotificationDeliveryError,
+    sanitize_delivery_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,15 +28,25 @@ class NotificationService:
     db: AsyncSession
     notification_repo: NotificationRepository
     delivery_adapter: NotificationDelivery
+    max_attempts: int
+    lease_seconds: int
 
     def __init__(
         self,
         db: AsyncSession,
         delivery_adapter: NotificationDelivery | None = None,
+        max_attempts: int | None = None,
+        lease_seconds: int | None = None,
     ) -> None:
         self.db = db
         self.notification_repo = NotificationRepository(db)
         self.delivery_adapter = delivery_adapter or InAppNotificationDelivery()
+        self.max_attempts = (
+            max_attempts if max_attempts is not None else settings.notification_max_attempts
+        )
+        self.lease_seconds = (
+            lease_seconds if lease_seconds is not None else settings.notification_claim_lease_seconds
+        )
 
     async def get_by_id(self, notification_id: int, user_id: int) -> Notification:
         """
@@ -93,48 +105,85 @@ class NotificationService:
 
     async def dispatch_notification(self, notification_id: int) -> None:
         """
-        Dispatches a notification:
-        1. Atomically locks and claims the notification (PENDING/FAILED -> PROCESSING).
-        2. Increments attempts.
-        3. Calls delivery adapter.
-        4. On success: sets status=SENT, sent_at=now.
-        5. On error: logs and sets status=FAILED, error_message=sanitized.
-        6. Commits transaction.
+        Transaction-safe, bounded, fenced notification dispatch:
+        1. Phase 1 (Short Transaction): Atomically claim notification with claim_token,
+           increment attempts, enforce max_attempts limit, and commit claim.
+        2. Phase 2 (Non-Transactional): Deliver via delivery adapter OUTSIDE database transaction.
+        3. Phase 3 (Short Transaction): Finalize outcome (SENT or FAILED) with claim_token fencing
+           and sanitized error category recording.
         """
+        claim_token = uuid.uuid4().hex
+        now = datetime.now(timezone.utc)
+
+        # -------------------------------------------------------------
+        # Phase 1: Atomically claim the notification in a short transaction
+        # -------------------------------------------------------------
+        claimed_notification: Notification | None = None
         try:
-            notification = await self.notification_repo.get_by_id_for_update(notification_id)
-            if not notification:
-                logger.warning("Notification %s not found for dispatch", notification_id)
-                await self.db.rollback()
-                return
-
-            # If already SENT, repeated dispatch does nothing
-            if notification.status == NotificationStatus.SENT:
-                await self.db.rollback()
-                return
-
-            # Claim notification: transition to PROCESSING and increment attempts
-            notification.status = NotificationStatus.PROCESSING
-            notification.attempts += 1
-            await self.db.flush()
-
-            # Attempt delivery via adapter
-            try:
-                await self.delivery_adapter.deliver(notification)
-                notification.status = NotificationStatus.SENT
-                notification.sent_at = datetime.now(timezone.utc)
-                notification.error_message = None
-            except (NotificationDeliveryError, Exception) as exc:
-                logger.error("Failed to deliver notification %s: %s", notification_id, exc)
-                notification.status = NotificationStatus.FAILED
-                notification.error_message = str(exc)
-
+            claimed_notification = await self.notification_repo.claim_for_dispatch(
+                notification_id=notification_id,
+                claim_token=claim_token,
+                now=now,
+                max_attempts=self.max_attempts,
+                lease_seconds=self.lease_seconds,
+            )
             await self.db.commit()
-
         except Exception as exc:
             try:
                 if self.db.is_active:
                     await self.db.rollback()
             except Exception:
                 pass
-            logger.exception("Unexpected error in dispatch_notification %s: %s", notification_id, exc)
+            logger.exception("Failed to claim notification %s: %s", notification_id, exc)
+            return
+
+        if not claimed_notification:
+            # Either already SENT, exceeding max_attempts, or claimed by active concurrent worker
+            logger.debug(
+                "Notification %s not eligible for claim or already processed", notification_id
+            )
+            return
+
+        # -------------------------------------------------------------
+        # Phase 2: Deliver OUTSIDE the database transaction
+        # -------------------------------------------------------------
+        success = False
+        sanitized_error: str | None = None
+        try:
+            await self.delivery_adapter.deliver(claimed_notification)
+            success = True
+        except Exception as exc:
+            sanitized_error = sanitize_delivery_error(exc)
+            logger.error(
+                "Delivery failed for notification %s [category=%s]",
+                notification_id,
+                sanitized_error,
+            )
+
+        # -------------------------------------------------------------
+        # Phase 3: Finalize outcome in another short transaction with fencing
+        # -------------------------------------------------------------
+        finalize_now = datetime.now(timezone.utc)
+        try:
+            finalized = await self.notification_repo.finalize_dispatch(
+                notification_id=notification_id,
+                claim_token=claim_token,
+                success=success,
+                now=finalize_now,
+                sanitized_error=sanitized_error,
+            )
+            if not finalized:
+                logger.warning(
+                    "Fencing check failed for notification %s: token mismatch or lease expired",
+                    notification_id,
+                )
+            await self.db.commit()
+        except Exception as exc:
+            try:
+                if self.db.is_active:
+                    await self.db.rollback()
+            except Exception:
+                pass
+            logger.exception(
+                "Failed to finalize dispatch for notification %s: %s", notification_id, exc
+            )
