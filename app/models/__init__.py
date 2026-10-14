@@ -12,6 +12,7 @@ from app.models.order_item import OrderItem
 from app.models.inventory_reservation import InventoryReservation, ReservationStatus
 from app.models.payment import Payment, PaymentStatus
 from app.models.webhook_event import WebhookEvent, WebhookEventStatus
+from app.models.shipment import Shipment, ShipmentStatus
 
 __all__ = [
     "Category",
@@ -32,4 +33,6 @@ __all__ = [
     "PaymentStatus",
     "WebhookEvent",
     "WebhookEventStatus",
+    "Shipment",
+    "ShipmentStatus",
 ]

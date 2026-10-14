@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from app.models.user import User
     from app.models.order_item import OrderItem
     from app.models.payment import Payment
+    from app.models.shipment import Shipment
 
 class OrderStatus(str, PyEnum):
     PENDING = "PENDING"
@@ -66,5 +67,11 @@ class Order(Base):
         back_populates="order",
         cascade="all, delete-orphan",
         order_by="Payment.created_at.desc()"
+    )
+    shipment: Mapped["Shipment | None"] = relationship(
+        "Shipment",
+        back_populates="order",
+        uselist=False,
+        cascade="all, delete-orphan",
     )
 
