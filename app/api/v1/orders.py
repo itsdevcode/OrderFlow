@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query, status, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, status, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies.auth import get_current_user
@@ -17,12 +17,15 @@ from app.exceptions.inventory import InsufficientStockError
 
 @router.post("", response_model=OrderRead, status_code=status.HTTP_201_CREATED)
 async def create_order(
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Create an order from the authenticated user's cart."""
     try:
-        return await OrderService(db).create_order_from_cart(current_user.id)
+        return await OrderService(db).create_order_from_cart(
+            current_user.id, background_tasks=background_tasks
+        )
     except EmptyCartError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     except ProductNotFoundError as exc:

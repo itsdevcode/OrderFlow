@@ -33,6 +33,11 @@ from app.schemas.webhook import PaymentWebhookPayload, WebhookResponse
 from app.services.inventory_reservation import InventoryReservationService
 from app.services.payment import PaymentService
 
+from app.api.background import dispatch_notification_task
+from app.models.notification import NotificationType
+from app.services.notification import NotificationService
+from fastapi import BackgroundTasks
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,6 +111,7 @@ class PaymentWebhookService:
         signature_header: str | None,
         secret: str | None = None,
         max_timestamp_skew_seconds: int = 300,
+        background_tasks: BackgroundTasks | None = None,
     ) -> WebhookResponse:
         """
         Entrypoint for payment webhook processing.
@@ -150,7 +156,7 @@ class PaymentWebhookService:
 
         # 5. Execute processing within caller-owned atomic transaction
         try:
-            return await self._execute_webhook_transaction(payload, payload_hash)
+            return await self._execute_webhook_transaction(payload, payload_hash, background_tasks=background_tasks)
         except IntegrityError:
             await self.db.rollback()
             # Handle concurrent race condition on (provider, provider_event_id) unique constraint
@@ -172,6 +178,7 @@ class PaymentWebhookService:
         self,
         payload: PaymentWebhookPayload,
         payload_hash: str,
+        background_tasks: BackgroundTasks | None = None,
     ) -> WebhookResponse:
         provider = payload.provider
         provider_event_id = payload.event_id
@@ -263,11 +270,12 @@ class PaymentWebhookService:
             raise PaymentNotFoundError(f"Payment {payment_id} not found")
 
         # Handle event types with durable reconciliation safety
+        pending_notification_id: int | None = None
         try:
             if payload.event_type == "payment.succeeded":
-                await self._handle_payment_succeeded(order, payment_locked, webhook_event)
+                pending_notification_id = await self._handle_payment_succeeded(order, payment_locked, webhook_event)
             elif payload.event_type == "payment.failed":
-                await self._handle_payment_failed(order, payment_locked, webhook_event)
+                pending_notification_id = await self._handle_payment_failed(order, payment_locked, webhook_event)
             else:
                 webhook_event.status = WebhookEventStatus.FAILED
                 webhook_event.error_message = f"Unsupported event type: {payload.event_type}"
@@ -306,6 +314,10 @@ class PaymentWebhookService:
         # Atomically commit all business changes
         await self.db.commit()
 
+        # Step 6: Dispatch background notification task only after successful commit
+        if background_tasks and pending_notification_id is not None:
+            background_tasks.add_task(dispatch_notification_task, pending_notification_id)
+
         return WebhookResponse(
             status="success",
             event_id=provider_event_id,
@@ -318,7 +330,7 @@ class PaymentWebhookService:
         order: Order,
         payment: Payment,
         webhook_event: WebhookEvent,
-    ) -> None:
+    ) -> int | None:
         """
         Handle payment.succeeded event:
         - If payment is already SUCCEEDED and order is CONFIRMED, this is idempotent.
@@ -327,11 +339,12 @@ class PaymentWebhookService:
         - Transition payment to SUCCEEDED.
         - Confirm inventory reservations (reduces reserved_quantity only, available_quantity untouched).
         - Transition order to CONFIRMED.
+        - Atomically create PAYMENT_SUCCEEDED pending notification.
         """
         # Idempotency check: if already SUCCEEDED
         if payment.status == PaymentStatus.SUCCEEDED:
             if order.status == OrderStatus.CONFIRMED:
-                return
+                return None
             if order.status == OrderStatus.CANCELLED:
                 raise WebhookPayloadError("Cannot process success for already cancelled order")
 
@@ -370,14 +383,25 @@ class PaymentWebhookService:
 
         # Transition order to CONFIRMED
         order.status = OrderStatus.CONFIRMED
+
+        # Atomically create PAYMENT_SUCCEEDED notification in the same transaction
+        notification_service = NotificationService(self.db)
+        notif = await notification_service.create_pending_notification(
+            user_id=order.user_id,
+            notification_type=NotificationType.PAYMENT_SUCCEEDED,
+            order_id=order.id,
+            order_number=order.order_number,
+            deduplication_key=f"payment.succeeded:{payment.id}",
+        )
         await self.db.flush()
+        return notif.id if notif else None
 
     async def _handle_payment_failed(
         self,
         order: Order,
         payment: Payment,
         webhook_event: WebhookEvent,
-    ) -> None:
+    ) -> int | None:
         """
         Handle payment.failed event:
         - If payment is already FAILED, idempotent.
@@ -385,13 +409,25 @@ class PaymentWebhookService:
         - Transition eligible PENDING payment to FAILED.
         - Do NOT cancel the order or release reservations automatically: customer is allowed to retry payment
           while order reservations remain ACTIVE until reservation expiry or customer cancellation.
+        - Atomically create PAYMENT_FAILED pending notification.
         """
         if payment.status == PaymentStatus.FAILED:
-            return
+            return None
 
         if payment.status == PaymentStatus.SUCCEEDED:
             raise WebhookPayloadError("Conflicting event: payment is already marked SUCCEEDED")
 
         # Transition payment to FAILED (caller-owned, no commit)
         _ = await self.payment_service.apply_payment_transition(payment, PaymentStatus.FAILED)
+
+        # Atomically create PAYMENT_FAILED notification in the same transaction
+        notification_service = NotificationService(self.db)
+        notif = await notification_service.create_pending_notification(
+            user_id=order.user_id,
+            notification_type=NotificationType.PAYMENT_FAILED,
+            order_id=order.id,
+            order_number=order.order_number,
+            deduplication_key=f"payment.failed:{payment.id}",
+        )
         await self.db.flush()
+        return notif.id if notif else None

@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.api.background import dispatch_notification_task
 from app.core.roles import RoleName
 from app.exceptions.order import OrderNotFoundError
 from app.exceptions.shipment import (
@@ -16,12 +17,15 @@ from app.exceptions.shipment import (
     ShipmentNotFoundError,
     TrackingConflictError,
 )
+from app.models.notification import NotificationType
 from app.models.order import Order, OrderStatus
 from app.models.shipment import Shipment, ShipmentStatus
 from app.models.user import User
 from app.repositories.payment import PaymentRepository
 from app.repositories.shipment import ShipmentRepository
 from app.schemas.shipment import ShipmentStatusUpdate
+from app.services.notification import NotificationService
+from fastapi import BackgroundTasks
 
 
 class ShipmentService:
@@ -211,6 +215,7 @@ class ShipmentService:
         self,
         shipment_id: int,
         update_data: ShipmentStatusUpdate,
+        background_tasks: BackgroundTasks | None = None,
     ) -> Shipment:
         """
         Transition shipment status with strict state machine and locking.
@@ -273,6 +278,7 @@ class ShipmentService:
                 )
 
             now = self._get_utc_now()
+            pending_notification_id: int | None = None
 
             # Transition-specific validations and mutations
             if target_status == ShipmentStatus.SHIPPED:
@@ -299,17 +305,46 @@ class ShipmentService:
                 shipment.status = ShipmentStatus.SHIPPED
                 shipment.shipped_at = now
 
+                # Create SHIPMENT_SHIPPED notification in the same transaction
+                notification_service = NotificationService(self.db)
+                notif = await notification_service.create_pending_notification(
+                    user_id=shipment.order.user_id,
+                    notification_type=NotificationType.SHIPMENT_SHIPPED,
+                    order_id=shipment.order.id,
+                    order_number=shipment.order.order_number,
+                    deduplication_key=f"shipment.shipped:{shipment.id}",
+                )
+                if notif:
+                    pending_notification_id = notif.id
+
             elif target_status == ShipmentStatus.DELIVERED:
                 # Preserve original shipped_at, tracking_number, and carrier
                 shipment.status = ShipmentStatus.DELIVERED
                 shipment.delivered_at = now
+
+                # Create SHIPMENT_DELIVERED notification in the same transaction
+                notification_service = NotificationService(self.db)
+                notif = await notification_service.create_pending_notification(
+                    user_id=shipment.order.user_id,
+                    notification_type=NotificationType.SHIPMENT_DELIVERED,
+                    order_id=shipment.order.id,
+                    order_number=shipment.order.order_number,
+                    deduplication_key=f"shipment.delivered:{shipment.id}",
+                )
+                if notif:
+                    pending_notification_id = notif.id
 
             elif target_status == ShipmentStatus.CANCELLED:
                 shipment.status = ShipmentStatus.CANCELLED
                 shipment.cancelled_at = now
 
             await self.db.commit()
-            await self.db.refresh(shipment)
+            _ = await self.db.refresh(shipment)
+
+            # Step: Dispatch background task after successful commit
+            if background_tasks and pending_notification_id is not None:
+                background_tasks.add_task(dispatch_notification_task, pending_notification_id)
+
             return shipment
 
         except (InvalidShipmentStateTransitionError, ShipmentNotFoundError, TrackingConflictError, HTTPException):
