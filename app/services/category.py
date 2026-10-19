@@ -1,20 +1,25 @@
-from sqlalchemy.ext.asyncio import AsyncSession
+import logging
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.category import Category
-from app.repositories.category import CategoryRepository
-from app.schemas.category import CategoryCreate, CategoryUpdate
 from app.exceptions.category import (
     CategoryAlreadyExistsError,
-    CategoryNotFoundError,
     CategoryHasProductsError,
+    CategoryNotFoundError,
 )
+from app.models.category import Category
+from app.repositories.category import CategoryRepository
+from app.schemas.category import CategoryCreate, CategoryResponse, CategoryUpdate
+from app.services.cache import CacheService, get_cache_service
+
+logger = logging.getLogger(__name__)
 
 
 class CategoryService:
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncSession, cache: CacheService | None = None) -> None:
         self.db: AsyncSession = db
         self.category_repo: CategoryRepository = CategoryRepository(db)
+        self.cache: CacheService = cache or get_cache_service()
 
     async def create_category(self, data: CategoryCreate) -> Category:
         # Check if name already exists
@@ -32,7 +37,7 @@ class CategoryService:
                 slug=data.slug,
                 description=data.description,
             )
-    
+
             # Transaction owned by service
             await self.db.commit()
         except IntegrityError as exc:
@@ -40,20 +45,76 @@ class CategoryService:
             raise CategoryAlreadyExistsError(
                 "Category name or slug already exists"
             ) from exc
-    
+
+        # Invalidate listing caches after successful commit
+        _ = await self.cache.bump_version("categories")
+        _ = await self.cache.bump_version("products")
+
         return category
 
-    async def list_categories(self, offset: int = 0, limit: int = 20) -> list[Category]:
-        return await self.category_repo.list(offset=offset, limit=limit)
-
-    async def get_category(self, category_id: int) -> Category:
+    async def get_category_model(self, category_id: int) -> Category:
+        """Fetch the authoritative Category ORM instance from PostgreSQL."""
         category = await self.category_repo.get_by_id(category_id)
         if not category:
             raise CategoryNotFoundError(f"Category with id {category_id} not found")
         return category
 
+    async def get_category(self, category_id: int) -> CategoryResponse:
+        """
+        Cache-aside read for single category detail.
+        Attempts Redis lookup, falls back to PostgreSQL on miss or failure,
+        and serializes validated response to Redis with bounded TTL.
+        """
+        cache_key = self.cache.build_key("categories", "detail", str(category_id))
+        cached_data = await self.cache.get(cache_key)
+        if cached_data is not None and isinstance(cached_data, dict):
+            try:
+                return CategoryResponse.model_validate(cached_data)
+            except Exception as exc:
+                logger.warning("Corrupted category cache for %s (%s); falling back to DB", cache_key, exc)
+
+        category = await self.get_category_model(category_id)
+        response = CategoryResponse.model_validate(category)
+        _ = await self.cache.set(cache_key, response.model_dump(mode="json"))
+        return response
+
+    async def list_categories(self, offset: int = 0, limit: int = 20) -> list[CategoryResponse]:
+        """
+        Cache-aside read for paginated category listings.
+        Uses versioned namespace keys to enable O(1) bulk invalidation without Redis KEYS.
+        """
+        version = await self.cache.get_version("categories")
+        cache_key = self.cache.build_key(
+            "categories",
+            "list",
+            f"v{version}",
+            offset=offset,
+            limit=limit,
+        )
+
+        cached_data = await self.cache.get(cache_key)
+        if cached_data is not None and isinstance(cached_data, list):
+            try:
+                from typing import cast
+                raw_list = cast(list[object], cached_data)
+                validated_items: list[CategoryResponse] = []
+                for item in raw_list:
+                    if isinstance(item, dict):
+                        validated_items.append(CategoryResponse.model_validate(item))
+                return validated_items
+            except Exception as exc:
+                logger.warning("Corrupted category list cache for %s (%s); falling back to DB", cache_key, exc)
+
+        categories = await self.category_repo.list(offset=offset, limit=limit)
+        response_list = [CategoryResponse.model_validate(c) for c in categories]
+        _ = await self.cache.set(
+            cache_key,
+            [item.model_dump(mode="json") for item in response_list],
+        )
+        return response_list
+
     async def update_category(self, category_id: int, data: CategoryUpdate) -> Category:
-        category = await self.get_category(category_id)
+        category = await self.get_category_model(category_id)
 
         changes: dict[str, str | bool | None] = data.model_dump(exclude_unset=True)
         if not changes:
@@ -78,10 +139,13 @@ class CategoryService:
             await self.db.rollback()
             raise CategoryAlreadyExistsError("Category name or slug already exists") from exc
 
+        # Invalidate affected category and product caches after successful commit
+        await self.cache.invalidate_category(category_id)
+
         return updated_category
 
     async def delete_category(self, category_id: int) -> None:
-        category = await self.get_category(category_id)
+        category = await self.get_category_model(category_id)
         category_name = category.name
         try:
             await self.category_repo.delete(category)
@@ -91,3 +155,6 @@ class CategoryService:
             raise CategoryHasProductsError(
                 f"Cannot delete category '{category_name}' as it has associated products"
             ) from exc
+
+        # Invalidate affected category and product caches after successful commit
+        await self.cache.invalidate_category(category_id)

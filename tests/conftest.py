@@ -15,6 +15,8 @@ from app.db.base import Base
 from app.db.session import get_db
 from app.main import app as fastapi_app
 
+from app.core.config import settings
+from app.core.redis import init_redis_client
 from app.core.roles import RoleName
 from app.core.security import hash_password
 from app.models.role import Role
@@ -24,6 +26,11 @@ TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL",
     "postgresql+asyncpg://orderflow_user:orderflow_password@localhost:5432/orderflow_test",
 )
+TEST_REDIS_URL = os.getenv(
+    "TEST_REDIS_URL",
+    "redis://localhost:6379/1",
+)
+settings.redis_url = TEST_REDIS_URL
 
 test_engine = create_async_engine(
     TEST_DATABASE_URL,
@@ -47,6 +54,24 @@ async def setup_database() -> AsyncGenerator[None, None]:
 
     async with test_engine.begin() as connection:
         await connection.run_sync(Base.metadata.drop_all)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def setup_redis() -> AsyncGenerator[None, None]:
+    client = await init_redis_client()
+    if client is not None:
+        try:
+            _ = await client.flushdb()
+        except Exception:
+            pass
+
+    yield
+
+    if client is not None:
+        try:
+            _ = await client.flushdb()
+        except Exception:
+            pass
 
 
 @pytest_asyncio.fixture

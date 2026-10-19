@@ -199,6 +199,128 @@ Once the server is running, you can access the interactive API docs:
 
 ---
 
+## ⚡ Redis Caching Architecture
+
+OrderFlow implements an optional, production-grade read-performance caching layer powered by **Redis** (`redis.asyncio`). PostgreSQL remains the strictly authoritative source of truth, while Redis accelerates catalog reads for Products and Categories.
+
+### 🏛️ Cache-Aside Architecture
+
+Catalog read endpoints follow the standard Cache-Aside pattern:
+
+```text
+       Client Request (GET /products or GET /categories)
+                         │
+                         ▼
+             [ Authenticate Current User ]
+                         │
+                         ▼
+               [ Build Cache Key ]
+                         │
+                         ▼
+                 Is Redis Online?
+                /                \
+           (Yes)                  (No)
+              │                     │
+      Attempt Cache GET             │
+           /     \                  │
+      (Hit)       (Miss)            │
+        │           │               │
+        │           ▼               ▼
+        │        Query PostgreSQL Authoritative Store
+        │           │               │
+        │       Serialize           │
+        │           │               │
+        │      Populate Redis       │
+        │      (Bounded TTL)        │
+        │           │               │
+        ▼           ▼               ▼
+      Return Validated JSON API Response
+```
+
+1. **Authentication First**: Endpoint authentication/RBAC dependencies execute before cache evaluation. Unauthenticated or unauthorized callers never receive cached data.
+2. **Deterministic Lookup**: A normalized, versioned cache key is computed from endpoints, resource IDs, pagination offsets/limits, and active filter flags.
+3. **Cache Hit**: Validated JSON payload is deserialized and returned immediately without touching PostgreSQL.
+4. **Cache Miss**: Authoritative data is fetched from PostgreSQL, validated against Pydantic response models, serialized, and written to Redis with a bounded TTL.
+5. **Safe Deserialization**: Any malformed or corrupted JSON encountered in Redis is treated as a cache miss, purged, and refreshed from PostgreSQL without returning HTTP 500.
+
+### 🔑 Cache Key Format
+
+All cache keys are structured deterministically with a prefix namespace:
+
+| Resource Type | Cache Key Format | Example |
+|---|---|---|
+| **Product Detail** | `orderflow:v1:products:detail:{product_id}` | `orderflow:v1:products:detail:42` |
+| **Category Detail** | `orderflow:v1:categories:detail:{category_id}` | `orderflow:v1:categories:detail:5` |
+| **Product Listings** | `orderflow:v1:products:list:v{version}:{query_params}` | `orderflow:v1:products:list:v3:category_id=5&is_active=true&limit=20&offset=0` |
+| **Category Listings** | `orderflow:v1:categories:list:v{version}:{query_params}` | `orderflow:v1:categories:list:v1:limit=20&offset=0` |
+| **Product Version Counter** | `orderflow:v1:products:version` | `orderflow:v1:products:version` |
+| **Category Version Counter** | `orderflow:v1:categories:version` | `orderflow:v1:categories:version` |
+
+- **Determinism**: Query parameters are sorted alphabetically, ensuring identical queries with different parameter orders hit the exact same cache entry.
+- **Null Safety**: Unset or null query parameters are omitted to prevent key fragmentation.
+
+### ⏳ TTL (Time-To-Live) Strategy
+
+- Every cache entry is written with an explicit, bounded TTL (`CACHE_DEFAULT_TTL_SECONDS`, default: 300 seconds / 5 minutes).
+- **TTL as Consistency Bound**: TTL guarantees that even in unhandled edge cases or network splits during invalidation, stale cache entries naturally expire within the bounded timeframe.
+- Sensitive authentication tokens, payment records, cart items, and inventory reservations are **never** cached.
+
+### 🔄 Invalidation Strategy
+
+OrderFlow adopts a **Post-Commit Versioned Namespace Invalidation** strategy:
+
+1. **Database Commit First**:
+   - All mutations (`POST`, `PATCH`, `DELETE`) execute against PostgreSQL.
+   - The database transaction MUST be successfully committed before any cache invalidation is attempted.
+   - If database commit fails or rolls back, **no cache invalidation or mutation occurs**.
+2. **Detail Invalidation**:
+   - Explicit `DEL` on affected resource keys (e.g. `orderflow:v1:products:detail:{id}`).
+3. **Listing Invalidation in O(1)**:
+   - Paginated listings are invalidated by atomically incrementing the namespace version counter via Redis `INCR` (e.g. `INCR orderflow:v1:products:version`).
+   - Prior listing combinations become instant cache misses; their memory is automatically reclaimed by Redis when their TTL expires.
+   - **Production Safety**: Completely eliminates blocking `KEYS *` commands from all production request and invalidation paths.
+4. **Relational Consistency**:
+   - Mutating a Category invalidates both the category detail, category listing version, AND product listing version. This prevents stale category-product listing relationships.
+
+### 🛡️ Resilience & Graceful Degradation
+
+- **Optional Startup**: Redis unavailability never prevents application startup. If unreachable, the service logs a sanitized warning and boots in degraded mode.
+- **Fail-Open Reads**: When Redis is down, reads seamlessly fall back to PostgreSQL with zero HTTP 500 errors.
+- **Fail-Safe Writes**: A Redis failure during cache invalidation never rolls back an already-committed database transaction.
+- **Circuit Breaker Cooldown**: When a Redis connection timeout occurs, an internal circuit breaker triggers a cooldown period (default: 5 seconds). During cooldown, Redis is bypassed instantly without making network calls, preventing repeated socket timeout latency on client requests.
+- **Secret Sanitization**: Redis connection URLs and error logs automatically mask credentials (`redis://user:***@host`).
+
+### ⚠️ Eventual-Consistency Limitations & Concurrent Races
+
+- **Concurrent Read/Write Race**:
+  In high-concurrency environments, a reader task that encounters a cache miss might fetch old state from PostgreSQL just before a writer updates PostgreSQL and invalidates the cache. If the reader writes its old state back to Redis after the writer's invalidation, Redis temporarily holds stale data.
+- **Consistency Bound**: TTL is the strict upper bound for staleness. Once TTL expires (or the next mutation occurs), consistency is restored. Strict cross-request serializability is not claimed for cached catalog reads.
+
+### ⚙️ Environment Variables
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `REDIS_URL` | `str` | `redis://localhost:6379/0` | Redis connection URL |
+| `CACHE_ENABLED` | `bool` | `true` | Globally enable or disable cache |
+| `CACHE_DEFAULT_TTL_SECONDS` | `int` | `300` | Default expiration TTL in seconds (5 min) |
+| `REDIS_CONNECT_TIMEOUT` | `float` | `2.0` | Socket connect timeout in seconds |
+| `REDIS_SOCKET_TIMEOUT` | `float` | `2.0` | Socket read/write timeout in seconds |
+| `TEST_REDIS_URL` | `str` | `redis://localhost:6379/1` | Redis database used for automated tests |
+
+### 🧪 Verifying Cache Hits and Invalidation
+
+Run the dedicated test suite:
+
+```bash
+# Run Redis integration test suite
+pytest tests/test_redis_cache.py -v
+
+# Run full test suite
+pytest -v
+```
+
+---
+
 ## 🧪 Development & Quality
 
 ### Code Type Checking

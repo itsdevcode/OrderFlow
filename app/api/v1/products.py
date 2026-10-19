@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Path, status
 
 from app.core.roles import RoleName
 from app.dependencies.auth import CurrentUser
+from app.dependencies.cache import Cache
 from app.dependencies.database import DbSession
 from app.dependencies.permissions import require_roles
 from app.exceptions.category import CategoryNotFoundError
@@ -27,9 +28,10 @@ Limit = Annotated[int, Query(ge=1, le=100)]
 async def create_product(
     data: ProductCreate,
     db: DbSession,
+    cache: Cache,
 ):
     try:
-        return await ProductService(db).create_product(data)
+        return await ProductService(db, cache=cache).create_product(data)
     except ProductAlreadyExistsError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -51,12 +53,13 @@ async def create_product(
 async def list_products(
     db: DbSession,
     _current_user: CurrentUser,
+    cache: Cache,
     offset: Offset = 0,
     limit: Limit = 20,
     category_id: int | None = None,
     is_active: bool | None = None,
 ):
-    return await ProductService(db).list_products(
+    return await ProductService(db, cache=cache).list_products(
         offset=offset,
         limit=limit,
         category_id=category_id,
@@ -69,9 +72,10 @@ async def get_product(
     product_id: PositiveId,
     db: DbSession,
     _current_user: CurrentUser,
+    cache: Cache,
 ):
     try:
-        return await ProductService(db).get_product(product_id)
+        return await ProductService(db, cache=cache).get_product(product_id)
     except ProductNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -88,9 +92,10 @@ async def update_product(
     product_id: PositiveId,
     data: ProductUpdate,
     db: DbSession,
+    cache: Cache,
 ):
     try:
-        return await ProductService(db).update_product(product_id, data)
+        return await ProductService(db, cache=cache).update_product(product_id, data)
     except ProductNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -121,9 +126,10 @@ async def update_product(
 async def delete_product(
     product_id: PositiveId,
     db: DbSession,
+    cache: Cache,
 ) -> None:
     try:
-        await ProductService(db).delete_product(product_id)
+        await ProductService(db, cache=cache).delete_product(product_id)
     except ProductNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
