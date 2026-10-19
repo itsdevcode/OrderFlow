@@ -275,26 +275,53 @@ OrderFlow adopts a **Post-Commit Versioned Namespace Invalidation** strategy:
    - If database commit fails or rolls back, **no cache invalidation or mutation occurs**.
 2. **Detail Invalidation**:
    - Explicit `DEL` on affected resource keys (e.g. `orderflow:v1:products:detail:{id}`).
-3. **Listing Invalidation in O(1)**:
-   - Paginated listings are invalidated by atomically incrementing the namespace version counter via Redis `INCR` (e.g. `INCR orderflow:v1:products:version`).
+3. **Listing Invalidation in O(1) & Version Initialization**:
+   - Paginated listings are invalidated by atomically incrementing the namespace version counter via an atomic Redis Lua script:
+     ```lua
+     local current = redis.call('GET', KEYS[1])
+     if not current then
+         redis.call('SET', KEYS[1], 2)
+         return 2
+     else
+         return redis.call('INCR', KEYS[1])
+     end
+     ```
+   - **Absence Fix**: When the namespace version key is absent in Redis (implicitly defaulting to `1`), the first mutation transitions directly to `2` (instead of standard `INCR` initializing to `1`). This guarantees that the first mutation strictly invalidates any listing previously cached under default version `v1`.
    - Prior listing combinations become instant cache misses; their memory is automatically reclaimed by Redis when their TTL expires.
    - **Production Safety**: Completely eliminates blocking `KEYS *` commands from all production request and invalidation paths.
 4. **Relational Consistency**:
    - Mutating a Category invalidates both the category detail, category listing version, AND product listing version. This prevents stale category-product listing relationships.
+5. **In-Flight Query Race Guard**:
+   - When serving listing requests (`list_products`, `list_categories`), the service reads the namespace version before executing the database query and re-verifies `v_after == version` prior to writing to Redis (`cache.set`). If a concurrent mutation bumped the version while the database query was in-flight, the potentially stale query result is discarded rather than cached.
 
-### 🛡️ Resilience & Graceful Degradation
+### 🛡️ Resilience & Multi-Worker Outage Recovery
 
 - **Optional Startup**: Redis unavailability never prevents application startup. If unreachable, the service logs a sanitized warning and boots in degraded mode.
 - **Fail-Open Reads**: When Redis is down, reads seamlessly fall back to PostgreSQL with zero HTTP 500 errors.
 - **Fail-Safe Writes**: A Redis failure during cache invalidation never rolls back an already-committed database transaction.
+- **Multi-Worker Outage Consistency**:
+  - When Redis is down or unreachable during a committed database mutation, the failed invalidations (detail keys and namespaces) are durably recorded in the PostgreSQL table `cache_pending_invalidations`.
+  - When Redis connectivity recovers, any API worker process handling subsequent catalog reads executes `sync_pending_invalidations(db)`.
+  - Concurrency between multiple API workers is coordinated safely via `SELECT ... ORDER BY id LIMIT 100 FOR UPDATE`.
+  - The recovering worker purges dirty keys and bumps namespace versions in Redis before serving the read, and deletes the reconciled database records only upon verified Redis success.
+  - This architecture ensures that **recovered Redis can never serve known-stale cache entries across multiple worker processes**.
 - **Circuit Breaker Cooldown**: When a Redis connection timeout occurs, an internal circuit breaker triggers a cooldown period (default: 5 seconds). During cooldown, Redis is bypassed instantly without making network calls, preventing repeated socket timeout latency on client requests.
+- **Corrupt List Payload Rejection**: If cached list data in Redis contains any non-dict item or fails Pydantic schema validation, the service rejects the entire payload, purges the corrupted key from Redis, and falls back to PostgreSQL to retrieve fresh authoritative data. Partial lists are never returned.
 - **Secret Sanitization**: Redis connection URLs and error logs automatically mask credentials (`redis://user:***@host`).
 
-### ⚠️ Eventual-Consistency Limitations & Concurrent Races
+### ⚠️ Unavoidable Cache Consistency Limitations & TTL Bounds
 
-- **Concurrent Read/Write Race**:
-  In high-concurrency environments, a reader task that encounters a cache miss might fetch old state from PostgreSQL just before a writer updates PostgreSQL and invalidates the cache. If the reader writes its old state back to Redis after the writer's invalidation, Redis temporarily holds stale data.
-- **Consistency Bound**: TTL is the strict upper bound for staleness. Once TTL expires (or the next mutation occurs), consistency is restored. Strict cross-request serializability is not claimed for cached catalog reads.
+In accordance with the CAP theorem and distributed systems design, Redis is an auxiliary, cache-aside read optimization layer, while PostgreSQL is the single authoritative source of truth. The following unavoidable consistency bounds apply:
+
+1. **Transient Outage Window**:
+   - If Redis becomes unreachable during a mutation, the pending invalidation is persisted in PostgreSQL.
+   - During the outage, reads fall back directly to PostgreSQL and receive fresh data.
+   - If Redis recovers, the very next read request through any API worker executes pending synchronization before reading or serving cache data, restoring consistency.
+2. **TTL as an Absolute Staleness Upper Bound**:
+   - In catastrophic scenarios (e.g. concurrent network partitioning where both Redis invalidation and database pending-invalidation logging fail), every cached entry is bounded by its Time-To-Live (`CACHE_DEFAULT_TTL_SECONDS`, default: 300 seconds).
+   - Stale data can never persist beyond this bounded window under any failure mode.
+3. **Read-After-Write Eventual Consistency Window**:
+   - In a cache-aside architecture, a microsecond window exists between the database commit and the subsequent Redis invalidation execution. Concurrent readers within this microsecond window may observe pre-mutation data before invalidation completes. Optimistic version guards (`v_after == version`) prevent in-flight queries from overwriting newer cache state.
 
 ### ⚙️ Environment Variables
 

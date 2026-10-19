@@ -1,4 +1,5 @@
 import logging
+from typing import cast
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,8 +48,7 @@ class CategoryService:
             ) from exc
 
         # Invalidate listing caches after successful commit
-        _ = await self.cache.bump_version("categories")
-        _ = await self.cache.bump_version("products")
+        await self.cache.invalidate_category(category.id, db=self.db)
 
         return category
 
@@ -62,16 +62,24 @@ class CategoryService:
     async def get_category(self, category_id: int) -> CategoryResponse:
         """
         Cache-aside read for single category detail.
-        Attempts Redis lookup, falls back to PostgreSQL on miss or failure,
+        Reconciles pending invalidations from Redis outages across multiple workers,
+        attempts Redis lookup, falls back to PostgreSQL on miss or failure,
         and serializes validated response to Redis with bounded TTL.
         """
+        await self.cache.sync_pending_invalidations(self.db)
+
         cache_key = self.cache.build_key("categories", "detail", str(category_id))
         cached_data = await self.cache.get(cache_key)
         if cached_data is not None and isinstance(cached_data, dict):
             try:
                 return CategoryResponse.model_validate(cached_data)
             except Exception as exc:
-                logger.warning("Corrupted category cache for %s (%s); falling back to DB", cache_key, exc)
+                logger.warning(
+                    "Corrupted category cache for %s (%s); purging and falling back to DB",
+                    cache_key,
+                    exc,
+                )
+                _ = await self.cache.delete(cache_key)
 
         category = await self.get_category_model(category_id)
         response = CategoryResponse.model_validate(category)
@@ -82,7 +90,10 @@ class CategoryService:
         """
         Cache-aside read for paginated category listings.
         Uses versioned namespace keys to enable O(1) bulk invalidation without Redis KEYS.
+        Rejects entire cached list if any item is malformed or invalid to prevent partial data.
         """
+        await self.cache.sync_pending_invalidations(self.db)
+
         version = await self.cache.get_version("categories")
         cache_key = self.cache.build_key(
             "categories",
@@ -95,22 +106,32 @@ class CategoryService:
         cached_data = await self.cache.get(cache_key)
         if cached_data is not None and isinstance(cached_data, list):
             try:
-                from typing import cast
                 raw_list = cast(list[object], cached_data)
                 validated_items: list[CategoryResponse] = []
                 for item in raw_list:
-                    if isinstance(item, dict):
-                        validated_items.append(CategoryResponse.model_validate(item))
+                    if not isinstance(item, dict):
+                        raise ValueError(f"Invalid non-dict item in cached category list: {type(item)}")
+                    validated_items.append(CategoryResponse.model_validate(item))
                 return validated_items
             except Exception as exc:
-                logger.warning("Corrupted category list cache for %s (%s); falling back to DB", cache_key, exc)
+                logger.warning(
+                    "Corrupted category list cache for %s (%s); purging and falling back to DB",
+                    cache_key,
+                    exc,
+                )
+                _ = await self.cache.delete(cache_key)
 
         categories = await self.category_repo.list(offset=offset, limit=limit)
         response_list = [CategoryResponse.model_validate(c) for c in categories]
-        _ = await self.cache.set(
-            cache_key,
-            [item.model_dump(mode="json") for item in response_list],
-        )
+
+        # Guard against read-version -> DB query -> cache SET race:
+        # Only populate cache if the namespace version has not changed during the query
+        v_after = await self.cache.get_version("categories")
+        if v_after == version:
+            _ = await self.cache.set(
+                cache_key,
+                [item.model_dump(mode="json") for item in response_list],
+            )
         return response_list
 
     async def update_category(self, category_id: int, data: CategoryUpdate) -> Category:
@@ -140,7 +161,7 @@ class CategoryService:
             raise CategoryAlreadyExistsError("Category name or slug already exists") from exc
 
         # Invalidate affected category and product caches after successful commit
-        await self.cache.invalidate_category(category_id)
+        await self.cache.invalidate_category(category_id, db=self.db)
 
         return updated_category
 
@@ -157,4 +178,4 @@ class CategoryService:
             ) from exc
 
         # Invalidate affected category and product caches after successful commit
-        await self.cache.invalidate_category(category_id)
+        await self.cache.invalidate_category(category_id, db=self.db)

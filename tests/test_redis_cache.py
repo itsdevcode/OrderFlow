@@ -21,6 +21,7 @@ from app.main import app as fastapi_app, lifespan
 from app.models.category import Category
 from app.models.product import Product
 from app.models.user import User
+from app.models.cache_invalidation import CachePendingInvalidation
 from app.schemas.product import ProductRead
 from app.services.cache import CacheService, get_cache_service
 
@@ -763,5 +764,432 @@ async def test_circuit_breaker_cooldown_bypasses_network_calls() -> None:
     assert res2 is None
     # Call count MUST remain 1 (no network attempt during cooldown!)
     assert stub.call_count == 1
+
+
+# ==============================================================================
+# Finding 1 Regression: Version Initialization Bug
+# ==============================================================================
+
+
+async def test_version_initialization_on_absent_key_invalidates_cleanly(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+) -> None:
+    """
+    Finding 1 Regression Test:
+    Ensures that when the Redis namespace version key is absent (defaults to 1),
+    the first mutation transitions it to 2 (instead of 1), so that
+    the next GET strictly invalidates the v1 cached listing and fetches fresh PostgreSQL data.
+    """
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    cache = get_cache_service()
+    redis = cache.client
+    assert redis is not None
+
+    # Step 1: Explicitly delete namespace version key and verify it is absent
+    version_key = cache.build_key("products", "version")
+    _ = await redis.delete(version_key)
+    assert await redis.get(version_key) is None
+    # get_version returns default 1 when key is absent
+    assert await cache.get_version("products") == 1
+
+    # Create category for products
+    cat_resp = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "Gaming", "slug": "gaming"})
+    assert cat_resp.status_code == 201
+    cat_id: int = cast(int, cat_resp.json()["id"])
+
+    # Create initial product
+    prod1_resp = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "Gamepad Pro", "slug": "gamepad-pro", "sku": "SKU-GP1", "price": 59.99, "category_id": cat_id
+    })
+    assert prod1_resp.status_code == 201
+
+    # Reset version key again to be 100% sure we start test with absent key
+    _ = await redis.delete(version_key)
+    assert await redis.get(version_key) is None
+    assert await cache.get_version("products") == 1
+
+    # Step 2: Warm product listing cache under absent version (evaluates to v1)
+    list_resp1 = await client.get("/api/v1/products", headers=customer_headers)
+    assert list_resp1.status_code == 200
+    items1 = cast(list[dict[str, object]], list_resp1.json())
+    assert len(items1) == 1
+    assert items1[0]["name"] == "Gamepad Pro"
+
+    # Verify listing is cached in Redis under v1 key
+    v1_list_key = cache.build_key("products", "list", "v1", limit=20, offset=0)
+    cached_v1 = await redis.get(v1_list_key)
+    assert cached_v1 is not None
+
+    # Step 3: Perform committed product mutation (create a second product)
+    prod2_resp = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "Gaming Mouse", "slug": "gaming-mouse", "sku": "SKU-GM1", "price": 39.99, "category_id": cat_id
+    })
+    assert prod2_resp.status_code == 201
+
+    # Verify version key in Redis transitioned to 2 (NOT 1!)
+    current_version = await cache.get_version("products")
+    assert current_version == 2
+    raw_v = await redis.get(version_key)
+    assert raw_v is not None
+    assert int(raw_v.decode() if isinstance(raw_v, bytes) else str(raw_v)) == 2
+
+    # Step 4: Next GET must return fresh PostgreSQL data (both products)
+    list_resp2 = await client.get("/api/v1/products", headers=customer_headers)
+    assert list_resp2.status_code == 200
+    items2 = cast(list[dict[str, object]], list_resp2.json())
+    assert len(items2) == 2
+    names = [str(p["name"]) for p in items2]
+    assert "Gamepad Pro" in names
+    assert "Gaming Mouse" in names
+
+    # Verify new listing is cached under v2 key
+    v2_list_key = cache.build_key("products", "list", "v2", limit=20, offset=0)
+    cached_v2 = await redis.get(v2_list_key)
+    assert cached_v2 is not None
+
+
+async def test_category_version_initialization_on_absent_key_invalidates_cleanly(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+) -> None:
+    """
+    Finding 1 Regression Test for Categories:
+    Ensures that starting with absent category version key, a mutation transitions
+    version from default 1 to 2, causing next listing GET to return fresh DB data.
+    """
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    cache = get_cache_service()
+    redis = cache.client
+    assert redis is not None
+
+    # Step 1: Ensure category version key is absent
+    cat_version_key = cache.build_key("categories", "version")
+    _ = await redis.delete(cat_version_key)
+    assert await redis.get(cat_version_key) is None
+    assert await cache.get_version("categories") == 1
+
+    # Create initial category
+    c1 = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "Furniture", "slug": "furniture"})
+    assert c1.status_code == 201
+
+    # Reset version key to absent to test warm cache under absent key
+    _ = await redis.delete(cat_version_key)
+    assert await redis.get(cat_version_key) is None
+
+    # Step 2: Warm category listing cache
+    resp1 = await client.get("/api/v1/categories", headers=customer_headers)
+    assert resp1.status_code == 200
+    c_items1 = cast(list[dict[str, object]], resp1.json())
+    assert len(c_items1) == 1
+    assert c_items1[0]["name"] == "Furniture"
+
+    # Step 3: Perform committed mutation (create second category)
+    c2 = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "Lighting", "slug": "lighting"})
+    assert c2.status_code == 201
+
+    # Verify version key transitioned to 2
+    assert await cache.get_version("categories") == 2
+
+    # Step 4: Next GET returns fresh DB data with both categories
+    resp2 = await client.get("/api/v1/categories", headers=customer_headers)
+    assert resp2.status_code == 200
+    c_items2 = cast(list[dict[str, object]], resp2.json())
+    cat_names = [str(c["name"]) for c in c_items2]
+    assert "Furniture" in cat_names
+    assert "Lighting" in cat_names
+
+
+# ==============================================================================
+# Finding 2 Regression: Cache Consistency After Redis Outage (Multi-Worker Safe)
+# ==============================================================================
+
+
+async def test_redis_outage_invalidation_failure_and_multi_worker_recovery(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+    db_session: AsyncSession,
+) -> None:
+    """
+    Finding 2 Regression Test:
+    1. Warm cache for product detail.
+    2. Simulate Redis outage during a committed DB mutation (update price).
+    3. Verify PostgreSQL write succeeds (preserves DB write).
+    4. Verify pending invalidation is persisted in PostgreSQL (for multi-worker sync).
+    5. While Redis is down, assert GET falls back to DB and returns fresh updated price.
+    6. Simulate Redis recovery (Redis still contains stale pre-outage cache entry).
+    7. Simulate an independent worker process performing GET.
+    8. Assert recovered Redis CANNOT serve the known-stale entry.
+    9. Assert response returns fresh data and updates Redis with the new value.
+    10. Assert pending invalidation table in PostgreSQL is cleanly reconciled.
+    """
+    from unittest.mock import patch
+    from redis.exceptions import ConnectionError as RedisConnError
+
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    cache = get_cache_service()
+    real_redis = cache.client
+    assert real_redis is not None
+
+    # Step 1: Create product and warm cache
+    cat_resp = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "Audio", "slug": "audio"})
+    cat_id: int = cast(int, cat_resp.json()["id"])
+    prod_resp = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "Headphones", "slug": "headphones", "sku": "SKU-HP1", "price": 100.0, "category_id": cat_id
+    })
+    prod_id: int = cast(int, prod_resp.json()["id"])
+
+    detail_key = cache.build_key("products", "detail", str(prod_id))
+
+    # Read to warm cache
+    warm_resp = await client.get(f"/api/v1/products/{prod_id}", headers=customer_headers)
+    assert warm_resp.status_code == 200
+    assert warm_resp.json()["price"] == "100.00"
+    assert await real_redis.get(detail_key) is not None
+
+    # Step 2 & 3: Simulate Redis outage during committed DB mutation.
+    # We patch CacheService.delete and bump_version to raise a RedisError during update
+    with patch.object(cache, "delete", side_effect=RedisConnError("Redis connection lost")), \
+         patch.object(cache, "bump_version", side_effect=RedisConnError("Redis connection lost")):
+        update_resp = await client.patch(
+            f"/api/v1/products/{prod_id}",
+            headers=admin_headers,
+            json={"price": 150.0},
+        )
+        assert update_resp.status_code == 200
+        assert update_resp.json()["price"] == "150.00"
+
+    # Step 4: Verify PostgreSQL write succeeded and pending invalidation was recorded in DB
+    check_stmt = select(CachePendingInvalidation).where(CachePendingInvalidation.key == detail_key)
+    pending_records = (await db_session.execute(check_stmt)).scalars().all()
+    assert len(pending_records) >= 1
+    assert pending_records[0].key == detail_key
+
+    # Notice: Redis still holds the old pre-outage cache entry ("100.00")!
+    raw_stale = await real_redis.get(detail_key)
+    assert raw_stale is not None
+    raw_stale_str = raw_stale.decode() if isinstance(raw_stale, bytes) else str(raw_stale)
+    assert "100.0" in raw_stale_str
+
+    # Step 5: While Redis is unavailable, read fallback to PostgreSQL works
+    with patch.object(real_redis, "delete", side_effect=RedisConnError("Redis still down")), \
+         patch.object(real_redis, "get", side_effect=RedisConnError("Redis still down")):
+        down_resp = await client.get(f"/api/v1/products/{prod_id}", headers=customer_headers)
+        assert down_resp.status_code == 200
+        assert down_resp.json()["price"] == "150.00"
+
+    # Step 6 & 7: Redis recovers! Subsequent GET executed by any worker process
+    # Clear circuit breaker cooldown to simulate Redis connectivity restoration
+    cache._record_success()
+    # Old stale entry is still physically in Redis until synced by the recovery mechanism.
+    # Now simulate a subsequent GET request:
+    recov_resp = await client.get(f"/api/v1/products/{prod_id}", headers=customer_headers)
+    assert recov_resp.status_code == 200
+
+    # Step 8: Assert recovered Redis CANNOT serve the known-stale entry ("100.00")
+    assert recov_resp.json()["price"] == "150.00"
+
+    # Step 9: Assert Redis now holds fresh data ($150.00)
+    raw_updated = await real_redis.get(detail_key)
+    assert raw_updated is not None
+    raw_updated_str = raw_updated.decode() if isinstance(raw_updated, bytes) else str(raw_updated)
+    assert "150.0" in raw_updated_str
+
+    # Step 10: Assert pending invalidations table in PostgreSQL is now empty
+    pending_after = (await db_session.execute(check_stmt)).scalars().all()
+    assert len(pending_after) == 0
+
+
+# ==============================================================================
+# Finding 3 Regression: Corrupt List Payload Handling
+# ==============================================================================
+
+
+async def test_corrupt_product_list_payload_rejects_and_falls_back_to_db(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+) -> None:
+    """
+    Finding 3 Regression Test for Products:
+    If a cached product list in Redis contains any malformed item (e.g. non-dict
+    or schema validation failure), the entire cached payload must be rejected,
+    purged from Redis, and fresh authoritative data fetched from PostgreSQL.
+    A partial list must NEVER be returned.
+    """
+    import json
+
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    cache = get_cache_service()
+    redis = cache.client
+    assert redis is not None
+
+    cat_resp = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "Monitors", "slug": "monitors"})
+    cat_id: int = cast(int, cat_resp.json()["id"])
+
+    # Create 2 products
+    p1 = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "4K Monitor", "slug": "4k-mon", "sku": "SKU-M4K", "price": 399.99, "category_id": cat_id
+    })
+    p2 = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "1440p Monitor", "slug": "2k-mon", "sku": "SKU-M2K", "price": 249.99, "category_id": cat_id
+    })
+    assert p1.status_code == 201 and p2.status_code == 201
+
+    # Case A: One item in cached list is a non-dict string corrupting the list
+    version = await cache.get_version("products")
+    list_key = cache.build_key("products", "list", f"v{version}", limit=20, offset=0)
+
+    p1_data = cast(dict[str, object], p1.json())
+    # Corrupted payload: 1 valid dict, 1 non-dict corrupt item
+    corrupted_payload: list[object] = [p1_data, "CORRUPT_NON_DICT_STRING"]
+    _ = await redis.set(list_key, json.dumps(corrupted_payload))
+
+    # GET request: must NOT return a partial list [p1]!
+    # Must reject entire list, purge key, query DB, and return full 2 items!
+    resp_a = await client.get("/api/v1/products", headers=customer_headers)
+    assert resp_a.status_code == 200
+    items_a = cast(list[dict[str, object]], resp_a.json())
+    assert len(items_a) == 2  # NOT 1!
+    names_a = [str(p["name"]) for p in items_a]
+    assert "4K Monitor" in names_a
+    assert "1440p Monitor" in names_a
+
+    # Case B: One item in cached list is a dict that fails Pydantic schema validation
+    # (e.g. missing required field 'sku' or invalid 'price')
+    corrupted_pydantic_payload: list[object] = [
+        p1_data,
+        {"id": 999, "name": "Broken Schema", "price": "invalid_non_numeric"}
+    ]
+    _ = await redis.set(list_key, json.dumps(corrupted_pydantic_payload))
+
+    resp_b = await client.get("/api/v1/products", headers=customer_headers)
+    assert resp_b.status_code == 200
+    items_b = cast(list[dict[str, object]], resp_b.json())
+    assert len(items_b) == 2  # NOT 1!
+    names_b = [str(p["name"]) for p in items_b]
+    assert "4K Monitor" in names_b
+    assert "1440p Monitor" in names_b
+
+
+async def test_corrupt_category_list_payload_rejects_and_falls_back_to_db(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+) -> None:
+    """
+    Finding 3 Regression Test for Categories:
+    Ensures that a category listing cache containing non-dict or invalid schema items
+    is completely rejected and purged, returning fresh full data from PostgreSQL.
+    """
+    import json
+
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    cache = get_cache_service()
+    redis = cache.client
+    assert redis is not None
+
+    c1 = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "Kitchen", "slug": "kitchen"})
+    c2 = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "Garden", "slug": "garden"})
+    assert c1.status_code == 201 and c2.status_code == 201
+
+    version = await cache.get_version("categories")
+    cat_list_key = cache.build_key("categories", "list", f"v{version}", limit=20, offset=0)
+
+    # Invalidate cache with corrupted list containing non-dict item
+    corrupted_data: list[object] = [cast(dict[str, object], c1.json()), 12345]  # 12345 is non-dict
+    _ = await redis.set(cat_list_key, json.dumps(corrupted_data))
+
+    resp = await client.get("/api/v1/categories", headers=customer_headers)
+    assert resp.status_code == 200
+    items = cast(list[dict[str, object]], resp.json())
+    assert len(items) == 2  # NOT 1!
+    names = [str(c["name"]) for c in items]
+    assert "Kitchen" in names
+    assert "Garden" in names
+
+
+# ==============================================================================
+# Additional Verification: In-Flight Race Condition Guard
+# ==============================================================================
+
+
+async def test_read_version_db_query_cache_set_race_guard(
+    client: AsyncClient,
+    admin_user: User,
+    db_session: AsyncSession,
+) -> None:
+    """
+    Verifies that if a concurrent mutation bumps the namespace version
+    while a DB query is in-flight, the stale in-flight query results are NOT
+    written into the cache (optimistic version guard).
+    """
+    from unittest.mock import patch
+    from app.services.product import ProductService
+
+    cache = get_cache_service()
+    redis = cache.client
+    assert redis is not None
+
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+    cat_resp = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "Hardware", "slug": "hw"})
+    cat_id: int = cast(int, cat_resp.json()["id"])
+    _ = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "Screwdriver", "slug": "screw-1", "sku": "SKU-SC1", "price": 9.99, "category_id": cat_id
+    })
+
+    version_before = await cache.get_version("products")
+    list_key = cache.build_key("products", "list", f"v{version_before}", limit=20, offset=0)
+    _ = await cache.delete(list_key)
+
+    service = ProductService(db_session, cache=cache)
+    prod_repo = service.product_repo
+
+    # Intercept list call: right after DB query, simulate concurrent bump_version
+    orig_list = prod_repo.list
+
+    async def mock_list(
+        offset: int = 0,
+        limit: int = 100,
+        category_id: int | None = None,
+        is_active: bool | None = None,
+    ) -> list[Product]:
+        res = await orig_list(offset=offset, limit=limit, category_id=category_id, is_active=is_active)
+        _ = await cache.bump_version("products")
+        return res
+
+    with patch.object(prod_repo, "list", side_effect=mock_list):
+        result = await service.list_products(offset=0, limit=20)
+        assert len(result) >= 1
+
+    # Assert that list_key under the old version was NOT written to cache
+    cached = await redis.get(list_key)
+    assert cached is None
+
 
 
