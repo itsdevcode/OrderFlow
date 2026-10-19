@@ -30,11 +30,14 @@ class CacheService:
         redis_client: Redis | None = None,
         default_ttl: int | None = None,
         cooldown_seconds: float = 5.0,
+        reconnect_cooldown: float = 5.0,
     ) -> None:
         self._custom_client: Redis | None = redis_client
         self.default_ttl: int = default_ttl or settings.cache_default_ttl_seconds
         self.cooldown_seconds: float = cooldown_seconds
+        self.reconnect_cooldown: float = reconnect_cooldown
         self._last_failure_time: float = 0.0
+        self._last_reconnect_time: float = 0.0
 
     @property
     def client(self) -> Redis | None:
@@ -42,6 +45,25 @@ class CacheService:
         if self._custom_client is not None:
             return self._custom_client
         return get_redis_client()
+
+    async def ensure_connected(self) -> Redis | None:
+        """
+        Attempts a bounded reconnection to Redis if not currently connected
+        and the reconnect cooldown period has elapsed.
+        Ensures Redis is never mandatory at startup while recovering automatically
+        when Redis becomes reachable again.
+        """
+        if not settings.cache_enabled:
+            return None
+        client = self.client
+        if client is not None:
+            return client
+        now = time.monotonic()
+        if now - self._last_reconnect_time < self.reconnect_cooldown:
+            return None
+        self._last_reconnect_time = now
+        from app.core.redis import init_redis_client
+        return await init_redis_client()
 
     @property
     def is_available(self) -> bool:
@@ -114,6 +136,7 @@ class CacheService:
         Retrieves and deserializes JSON cached data for the given key.
         Gracefully handles misses, connection errors, and corrupted/malformed JSON.
         """
+        _ = await self.ensure_connected()
         if not self.is_available:
             return None
 
@@ -156,6 +179,7 @@ class CacheService:
         Serializes and caches validated JSON-compatible response data with bounded TTL.
         Returns True on success, False on degradation/error.
         """
+        _ = await self.ensure_connected()
         if not self.is_available:
             return False
 
@@ -175,6 +199,7 @@ class CacheService:
 
     async def delete(self, key: str) -> bool:
         """Deletes a single cache key. Returns True if successfully deleted or absent."""
+        _ = await self.ensure_connected()
         if not self.is_available:
             return False
 
@@ -195,6 +220,7 @@ class CacheService:
         valid_keys = [k for k in keys if k]
         if not valid_keys:
             return 0
+        _ = await self.ensure_connected()
         if not self.is_available:
             return -1
 
@@ -215,6 +241,7 @@ class CacheService:
         Retrieves the current version counter for a namespace (defaults to 1).
         Used for versioned namespace invalidation of paginated listings.
         """
+        _ = await self.ensure_connected()
         if not self.is_available:
             return 1
 
@@ -244,6 +271,7 @@ class CacheService:
         invalidates any listing previously cached under default version 1.
         Instantly invalidates all cached listings under this namespace in O(1).
         """
+        _ = await self.ensure_connected()
         if not self.is_available:
             return 1
 
@@ -269,85 +297,145 @@ class CacheService:
             self._record_failure(exc)
             return 1
 
-    async def record_pending_invalidation(
+    def stage_product_invalidation(
         self,
         db: AsyncSession,
-        key: str | None = None,
-        namespace: str | None = None,
-    ) -> None:
+        product_id: int,
+    ) -> list[CachePendingInvalidation]:
         """
-        Persists a failed invalidation in PostgreSQL so any API worker process
-        can safely reconcile Redis upon recovery without relying on local process state.
+        Stages durable cache-invalidation intent in PostgreSQL in the SAME transaction
+        as the product mutation. Must be called before db.commit().
         """
         if not settings.cache_enabled:
-            return
+            return []
+        detail_key = self.build_key("products", "detail", str(product_id))
+        event = CachePendingInvalidation(key=detail_key, namespace="products")
+        db.add(event)
+        return [event]
+
+    def stage_category_invalidation(
+        self,
+        db: AsyncSession,
+        category_id: int,
+    ) -> list[CachePendingInvalidation]:
+        """
+        Stages durable cache-invalidation intent in PostgreSQL in the SAME transaction
+        as the category mutation. Must be called before db.commit().
+        Stages both category detail/listing and products listing (for relational consistency).
+        """
+        if not settings.cache_enabled:
+            return []
+        detail_key = self.build_key("categories", "detail", str(category_id))
+        event1 = CachePendingInvalidation(key=detail_key, namespace="categories")
+        event2 = CachePendingInvalidation(namespace="products")
+        db.add(event1)
+        db.add(event2)
+        return [event1, event2]
+
+    async def execute_staged_invalidations(
+        self,
+        db: AsyncSession,
+        events: list[CachePendingInvalidation],
+    ) -> bool:
+        """
+        Executes staged cache invalidations against Redis after DB commit.
+        Only deletes/acknowledges the pending events from PostgreSQL if all
+        Redis operations succeed.
+        If Redis is down or operations fail, the events are retained in PostgreSQL
+        for later multi-worker reconciliation via sync_pending_invalidations.
+        """
+        if not settings.cache_enabled or not events:
+            return True
+
+        _ = await self.ensure_connected()
+
+        if not self.is_available or self.client is None:
+            return False
+
+        keys_to_del: list[str] = [e.key for e in events if e.key]
+        namespaces_to_bump: set[str] = {e.namespace for e in events if e.namespace}
+        event_ids: list[int] = [e.id for e in events]
+
         try:
-            pending = CachePendingInvalidation(key=key, namespace=namespace)
-            db.add(pending)
-            await db.commit()
+            if keys_to_del:
+                del_res = await self.delete_many(*keys_to_del)
+                if del_res < 0:
+                    return False
+
+            for ns in namespaces_to_bump:
+                val = await self.bump_version(ns)
+                if val <= 1 and not self.is_available:
+                    return False
+
+            if event_ids:
+                _ = await db.execute(
+                    delete(CachePendingInvalidation).where(CachePendingInvalidation.id.in_(event_ids))
+                )
+                await db.commit()
+            return True
         except Exception as exc:
             try:
                 await db.rollback()
             except Exception:
                 pass
             logger.warning(
-                "Failed to persist pending cache invalidation to PostgreSQL: %s",
+                "Failed to acknowledge staged invalidations: %s",
                 sanitize_log_message(str(exc)),
             )
+            return False
 
-    async def sync_pending_invalidations(self, db: AsyncSession) -> None:
+    async def sync_pending_invalidations(self, db: AsyncSession) -> bool:
         """
         Reconciles pending invalidations stored in PostgreSQL into Redis.
-        Called on catalog reads so that once Redis recovers, any API worker process
-        immediately purges known-stale entries before serving cached data.
-        Uses with_for_update() ordered by ID for safe concurrency across multiple workers.
+        Returns:
+            True: if there are no pending invalidations, or all pending invalidations
+                  were successfully reconciled into Redis.
+            False: if pending invalidations exist but could not be reconciled into Redis
+                   (or DB reconciliation query failed), signaling that Redis may contain
+                   stale data and must be bypassed for this request.
         """
-        if not settings.cache_enabled or not self.is_available:
-            return
+        if not settings.cache_enabled:
+            return True
 
-        client = self.client
-        if client is None:
-            return
+        _ = await self.ensure_connected()
 
         try:
-            stmt = (
-                select(CachePendingInvalidation)
-                .order_by(CachePendingInvalidation.id)
-                .limit(100)
-                .with_for_update()
-            )
-            result = await db.execute(stmt)
-            rows = list(result.scalars().all())
-            if not rows:
-                return
+            while True:
+                stmt = (
+                    select(CachePendingInvalidation)
+                    .order_by(CachePendingInvalidation.id)
+                    .limit(100)
+                    .with_for_update()
+                )
+                result = await db.execute(stmt)
+                rows = list(result.scalars().all())
+                if not rows:
+                    return True
 
-            keys_to_del: list[str] = []
-            namespaces_to_bump: set[str] = set()
-            row_ids: list[int] = []
-
-            for row in rows:
-                row_ids.append(row.id)
-                if row.key:
-                    keys_to_del.append(row.key)
-                if row.namespace:
-                    namespaces_to_bump.add(row.namespace)
-
-            if keys_to_del:
-                del_ok = await self.delete_many(*keys_to_del)
-                if del_ok < 0:
+                if not self.is_available or self.client is None:
                     await db.rollback()
-                    return
+                    return False
 
-            for ns in namespaces_to_bump:
-                val = await self.bump_version(ns)
-                if val <= 1 and not self.is_available:
-                    await db.rollback()
-                    return
+                keys_to_del: list[str] = [r.key for r in rows if r.key]
+                namespaces_to_bump: set[str] = {r.namespace for r in rows if r.namespace}
+                row_ids: list[int] = [r.id for r in rows]
 
-            _ = await db.execute(
-                delete(CachePendingInvalidation).where(CachePendingInvalidation.id.in_(row_ids))
-            )
-            await db.commit()
+                if keys_to_del:
+                    del_res = await self.delete_many(*keys_to_del)
+                    if del_res < 0:
+                        await db.rollback()
+                        return False
+
+                for ns in namespaces_to_bump:
+                    val = await self.bump_version(ns)
+                    if val <= 1 and not self.is_available:
+                        await db.rollback()
+                        return False
+
+                _ = await db.execute(
+                    delete(CachePendingInvalidation).where(CachePendingInvalidation.id.in_(row_ids))
+                )
+                await db.commit()
         except Exception as exc:
             try:
                 await db.rollback()
@@ -357,60 +445,35 @@ class CacheService:
                 "Failed to sync pending cache invalidations: %s",
                 sanitize_log_message(str(exc)),
             )
+            return False
 
     async def invalidate_product(
         self,
         product_id: int,
-        db: AsyncSession | None = None,
+        _db: AsyncSession | None = None,
     ) -> None:
         """
         Invalidates product detail cache and bumps product listings version.
-        If Redis is unreachable and db is provided, records pending invalidation in PostgreSQL
-        for multi-worker consistency upon Redis recovery.
+        Maintained for backwards-compatibility or explicit post-commit invalidation calls.
         """
         detail_key = self.build_key("products", "detail", str(product_id))
-        del_ok = False
-        bump_ok = False
-        if self.is_available:
-            try:
-                del_ok = await self.delete(detail_key)
-                bump_res = await self.bump_version("products")
-                bump_ok = bump_res > 1
-            except Exception as exc:
-                logger.warning("Error during product cache invalidation: %s", sanitize_log_message(str(exc)))
-
-        if settings.cache_enabled and (not del_ok or not bump_ok) and db is not None:
-            await self.record_pending_invalidation(db, key=detail_key, namespace="products")
+        _ = await self.delete(detail_key)
+        _ = await self.bump_version("products")
 
     async def invalidate_category(
         self,
         category_id: int,
-        db: AsyncSession | None = None,
+        _db: AsyncSession | None = None,
     ) -> None:
         """
         Invalidates category detail cache, category listings version,
-        and product listings version (to prevent stale category-product relationships).
-        If Redis is unreachable and db is provided, records pending invalidation in PostgreSQL
-        for multi-worker consistency upon Redis recovery.
+        and product listings version.
+        Maintained for backwards-compatibility or explicit post-commit invalidation calls.
         """
         detail_key = self.build_key("categories", "detail", str(category_id))
-        del_ok = False
-        bump_cat_ok = False
-        bump_prod_ok = False
-        if self.is_available:
-            try:
-                del_ok = await self.delete(detail_key)
-                bump_cat_res = await self.bump_version("categories")
-                bump_cat_ok = bump_cat_res > 1
-                bump_prod_res = await self.bump_version("products")
-                bump_prod_ok = bump_prod_res > 1
-            except Exception as exc:
-                logger.warning("Error during category cache invalidation: %s", sanitize_log_message(str(exc)))
-
-        if settings.cache_enabled and (not del_ok or not bump_cat_ok) and db is not None:
-            await self.record_pending_invalidation(db, key=detail_key, namespace="categories")
-        if settings.cache_enabled and not bump_prod_ok and db is not None:
-            await self.record_pending_invalidation(db, namespace="products")
+        _ = await self.delete(detail_key)
+        _ = await self.bump_version("categories")
+        _ = await self.bump_version("products")
 
 
 _default_cache_service: CacheService | None = None
