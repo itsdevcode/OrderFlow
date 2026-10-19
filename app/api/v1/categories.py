@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Path, status
 
 from app.core.roles import RoleName
 from app.dependencies.auth import CurrentUser
+from app.dependencies.cache import Cache
 from app.dependencies.database import DbSession
 from app.dependencies.permissions import require_roles
 from app.exceptions.category import CategoryAlreadyExistsError, CategoryNotFoundError, CategoryHasProductsError
@@ -26,9 +27,10 @@ Limit = Annotated[int, Query(ge=1, le=100)]
 async def create_category(
     data: CategoryCreate,
     db: DbSession,
+    cache: Cache,
 ):
     try:
-        return await CategoryService(db).create_category(data)
+        return await CategoryService(db, cache=cache).create_category(data)
     except CategoryAlreadyExistsError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -40,10 +42,11 @@ async def create_category(
 async def list_categories(
     db: DbSession,
     _current_user: CurrentUser,
+    cache: Cache,
     offset: Offset = 0,
     limit: Limit = 20,
 ):
-    return await CategoryService(db).list_categories(offset=offset, limit=limit)
+    return await CategoryService(db, cache=cache).list_categories(offset=offset, limit=limit)
 
 
 @router.get("/{category_id}", response_model=CategoryResponse)
@@ -51,9 +54,10 @@ async def get_category(
     category_id: PositiveId,
     db: DbSession,
     _current_user: CurrentUser,
+    cache: Cache,
 ):
     try:
-        return await CategoryService(db).get_category(category_id)
+        return await CategoryService(db, cache=cache).get_category(category_id)
     except CategoryNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -70,9 +74,10 @@ async def update_category(
     category_id: PositiveId,
     data: CategoryUpdate,
     db: DbSession,
+    cache: Cache,
 ):
     try:
-        return await CategoryService(db).update_category(category_id, data)
+        return await CategoryService(db, cache=cache).update_category(category_id, data)
     except CategoryNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -93,9 +98,10 @@ async def update_category(
 async def delete_category(
     category_id: PositiveId,
     db: DbSession,
+    cache: Cache,
 ) -> None:
     try:
-        await CategoryService(db).delete_category(category_id)
+        await CategoryService(db, cache=cache).delete_category(category_id)
     except CategoryNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

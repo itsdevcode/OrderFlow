@@ -19,6 +19,7 @@ from app.models.notification import (
     NotificationType,
     NotificationChannel,
 )
+from app.models.cache_invalidation import CachePendingInvalidation
 
 __all__ = [
     "Category",
@@ -45,4 +46,5 @@ __all__ = [
     "NotificationStatus",
     "NotificationType",
     "NotificationChannel",
+    "CachePendingInvalidation",
 ]

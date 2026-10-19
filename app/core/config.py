@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     payment_webhook_max_bytes: int = 65536  # 64 KB
     notification_max_attempts: int = 3
     notification_claim_lease_seconds: int = 300  # 5 minutes
+    redis_url: str = "redis://localhost:6379/0"
+    cache_enabled: bool = True
+    cache_default_ttl_seconds: int = 300  # 5 minutes
+    redis_connect_timeout: float = 2.0
+    redis_socket_timeout: float = 2.0
     model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
