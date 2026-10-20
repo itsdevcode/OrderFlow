@@ -34,7 +34,7 @@ def sanitize_redis_url(url: str) -> str:
 
 def sanitize_log_message(msg: str) -> str:
     """Mask any embedded passwords in error strings."""
-    return re.sub(r"://([^:@]+):([^@]+)@", r"://\1:***@", str(msg))
+    return re.sub(r"://([^:@]*):([^@]+)@", r"://\1:***@", str(msg))
 
 
 async def init_redis_client() -> Redis | None:
@@ -53,6 +53,7 @@ async def init_redis_client() -> Redis | None:
         if _redis_client is not None:
             return _redis_client
 
+        client: Redis | None = None
         try:
             client = aioredis.from_url(
                 settings.redis_url,
@@ -73,6 +74,11 @@ async def init_redis_client() -> Redis | None:
                 exc.__class__.__name__,
                 sanitized_err,
             )
+            if client is not None:
+                try:
+                    await client.aclose()
+                except (RedisError, OSError, asyncio.TimeoutError):
+                    pass
             _redis_client = None
             return None
 
@@ -88,6 +94,41 @@ async def close_redis_client() -> None:
                 logger.warning("Error closing Redis client: %s", sanitize_log_message(str(exc)))
             finally:
                 _redis_client = None
+
+
+_last_reconnect_attempt: float = 0.0
+
+
+async def ensure_redis_connected(cooldown_seconds: float = 5.0) -> Redis | None:
+    """
+    Attempts bounded reconnection to Redis if not currently connected
+    and the cooldown period has elapsed.
+    Avoids creating connections per request and prevents blocking loops.
+    Reuses async Redis connection pooling.
+    """
+    global _redis_client, _last_reconnect_attempt
+
+    if not settings.cache_enabled:
+        return None
+
+    if _redis_client is not None:
+        return _redis_client
+
+    import time
+    now = time.monotonic()
+    if now - _last_reconnect_attempt < cooldown_seconds:
+        return None
+
+    # No await between checking and reserving the attempt on this event loop.
+    # init_redis_client owns the pool lock; never acquire it recursively.
+    _last_reconnect_attempt = time.monotonic()
+    return await init_redis_client()
+
+
+def reset_reconnect_cooldown() -> None:
+    """Resets the reconnect cooldown timestamp (useful for tests and manual triggers)."""
+    global _last_reconnect_attempt
+    _last_reconnect_attempt = 0.0
 
 
 def get_redis_client() -> Redis | None:

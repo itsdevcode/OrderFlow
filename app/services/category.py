@@ -11,7 +11,7 @@ from app.exceptions.category import (
 from app.models.category import Category
 from app.repositories.category import CategoryRepository
 from app.schemas.category import CategoryCreate, CategoryResponse, CategoryUpdate
-from app.services.cache import CacheService, get_cache_service
+from app.services.cache import CacheService, ReconciliationOutcome, get_cache_service
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,17 @@ class CategoryService:
         self.category_repo: CategoryRepository = CategoryRepository(db)
         self.cache: CacheService = cache or get_cache_service()
 
+    def _check_write_boundary(self) -> None:
+        """Writes own commits; do not adopt explicit or dirty caller transactions."""
+        tx = self.db.sync_session.get_transaction()
+        if (tx is not None and tx.origin.name != "AUTOBEGIN") or (
+            self.db.new or self.db.dirty or self.db.deleted
+            or self.db.info.get("uncommitted_writes", False)
+        ):
+            raise RuntimeError("Catalog writes require a clean, service-owned transaction")
+
     async def create_category(self, data: CategoryCreate) -> Category:
+        self._check_write_boundary()
         # Check if name already exists
         if await self.category_repo.get_by_name(data.name):
             raise CategoryAlreadyExistsError(f"Category with name '{data.name}' already exists")
@@ -39,16 +49,21 @@ class CategoryService:
                 description=data.description,
             )
 
-            # Transaction owned by service
+            # Persist durable cache-invalidation event in the same transaction
+            events = await self.cache.stage_category_invalidation(self.db, category.id)
+            # Commit both atomically
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
             raise CategoryAlreadyExistsError(
                 "Category name or slug already exists"
             ) from exc
+        except Exception:
+            await self.db.rollback()
+            raise
 
-        # Invalidate listing caches after successful commit
-        await self.cache.invalidate_category(category.id, db=self.db)
+        # After commit, attempt Redis invalidation; acknowledge event only on success
+        _ = await self.cache.execute_staged_invalidations(self.db, events)
 
         return category
 
@@ -66,8 +81,12 @@ class CategoryService:
         attempts Redis lookup, falls back to PostgreSQL on miss or failure,
         and serializes validated response to Redis with bounded TTL.
         """
-        await self.cache.sync_pending_invalidations(self.db)
+        outcome = await self.cache.sync_pending_invalidations(self.db)
+        if outcome != ReconciliationOutcome.SUCCESS:
+            category = await self.get_category_model(category_id)
+            return CategoryResponse.model_validate(category)
 
+        version = await self.cache.get_version("categories")
         cache_key = self.cache.build_key("categories", "detail", str(category_id))
         cached_data = await self.cache.get(cache_key)
         if cached_data is not None and isinstance(cached_data, dict):
@@ -83,7 +102,9 @@ class CategoryService:
 
         category = await self.get_category_model(category_id)
         response = CategoryResponse.model_validate(category)
-        _ = await self.cache.set(cache_key, response.model_dump(mode="json"))
+        v_after = await self.cache.get_version("categories")
+        if v_after == version:
+            _ = await self.cache.set_if_version(cache_key, response.model_dump(mode="json"), "categories", version)
         return response
 
     async def list_categories(self, offset: int = 0, limit: int = 20) -> list[CategoryResponse]:
@@ -92,7 +113,10 @@ class CategoryService:
         Uses versioned namespace keys to enable O(1) bulk invalidation without Redis KEYS.
         Rejects entire cached list if any item is malformed or invalid to prevent partial data.
         """
-        await self.cache.sync_pending_invalidations(self.db)
+        outcome = await self.cache.sync_pending_invalidations(self.db)
+        if outcome != ReconciliationOutcome.SUCCESS:
+            categories = await self.category_repo.list(offset=offset, limit=limit)
+            return [CategoryResponse.model_validate(c) for c in categories]
 
         version = await self.cache.get_version("categories")
         cache_key = self.cache.build_key(
@@ -128,13 +152,15 @@ class CategoryService:
         # Only populate cache if the namespace version has not changed during the query
         v_after = await self.cache.get_version("categories")
         if v_after == version:
-            _ = await self.cache.set(
+            _ = await self.cache.set_if_version(
                 cache_key,
                 [item.model_dump(mode="json") for item in response_list],
+                "categories", version,
             )
         return response_list
 
     async def update_category(self, category_id: int, data: CategoryUpdate) -> Category:
+        self._check_write_boundary()
         category = await self.get_category_model(category_id)
 
         changes: dict[str, str | bool | None] = data.model_dump(exclude_unset=True)
@@ -155,27 +181,36 @@ class CategoryService:
 
         try:
             updated_category = await self.category_repo.update(category, **changes)
+            events = await self.cache.stage_category_invalidation(self.db, category_id)
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
             raise CategoryAlreadyExistsError("Category name or slug already exists") from exc
+        except Exception:
+            await self.db.rollback()
+            raise
 
-        # Invalidate affected category and product caches after successful commit
-        await self.cache.invalidate_category(category_id, db=self.db)
+        # After commit, attempt Redis invalidation; acknowledge event only on success
+        _ = await self.cache.execute_staged_invalidations(self.db, events)
 
         return updated_category
 
     async def delete_category(self, category_id: int) -> None:
+        self._check_write_boundary()
         category = await self.get_category_model(category_id)
         category_name = category.name
         try:
             await self.category_repo.delete(category)
+            events = await self.cache.stage_category_invalidation(self.db, category_id)
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
             raise CategoryHasProductsError(
                 f"Cannot delete category '{category_name}' as it has associated products"
             ) from exc
+        except Exception:
+            await self.db.rollback()
+            raise
 
-        # Invalidate affected category and product caches after successful commit
-        await self.cache.invalidate_category(category_id, db=self.db)
+        # After commit, attempt Redis invalidation; acknowledge event only on success
+        _ = await self.cache.execute_staged_invalidations(self.db, events)
