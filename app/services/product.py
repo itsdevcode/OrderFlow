@@ -51,7 +51,9 @@ class ProductService:
                 is_active=data.is_active,
             )
 
-            # Transaction owned by service
+            # Persist durable cache-invalidation event in the same transaction
+            events = self.cache.stage_product_invalidation(self.db, product.id)
+            # Commit both atomically
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
@@ -59,8 +61,8 @@ class ProductService:
                 "Product SKU or slug already exists"
             ) from exc
 
-        # Invalidate listing caches after successful commit
-        await self.cache.invalidate_product(product.id, db=self.db)
+        # After commit, attempt Redis invalidation; acknowledge event only on success
+        _ = await self.cache.execute_staged_invalidations(self.db, events)
 
         return product
 
@@ -78,7 +80,10 @@ class ProductService:
         attempts Redis lookup, falls back to PostgreSQL on miss or failure,
         and serializes validated response to Redis with bounded TTL.
         """
-        await self.cache.sync_pending_invalidations(self.db)
+        sync_ok = await self.cache.sync_pending_invalidations(self.db)
+        if not sync_ok:
+            product = await self.get_product_model(product_id)
+            return ProductRead.model_validate(product)
 
         cache_key = self.cache.build_key("products", "detail", str(product_id))
         cached_data = await self.cache.get(cache_key)
@@ -110,7 +115,15 @@ class ProductService:
         Uses versioned namespace keys to enable O(1) bulk invalidation without Redis KEYS.
         Rejects entire cached list if any item is malformed or invalid to prevent partial data.
         """
-        await self.cache.sync_pending_invalidations(self.db)
+        sync_ok = await self.cache.sync_pending_invalidations(self.db)
+        if not sync_ok:
+            products = await self.product_repo.list(
+                offset=offset,
+                limit=limit,
+                category_id=category_id,
+                is_active=is_active,
+            )
+            return [ProductRead.model_validate(p) for p in products]
 
         version = await self.cache.get_version("products")
         cache_key = self.cache.build_key(
@@ -190,13 +203,14 @@ class ProductService:
 
         try:
             updated_product = await self.product_repo.update(product, **changes)
+            events = self.cache.stage_product_invalidation(self.db, product_id)
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
             raise ProductAlreadyExistsError("Product SKU or slug already exists") from exc
 
-        # Invalidate affected product caches after successful commit
-        await self.cache.invalidate_product(product_id, db=self.db)
+        # After commit, attempt Redis invalidation; acknowledge event only on success
+        _ = await self.cache.execute_staged_invalidations(self.db, events)
 
         return updated_product
 
@@ -204,10 +218,11 @@ class ProductService:
         product = await self.get_product_model(product_id)
         try:
             await self.product_repo.delete(product)
+            events = self.cache.stage_product_invalidation(self.db, product_id)
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
             raise ProductAlreadyExistsError("Cannot delete product due to database integrity constraints") from exc
 
-        # Invalidate affected product caches after successful commit
-        await self.cache.invalidate_product(product_id, db=self.db)
+        # After commit, attempt Redis invalidation; acknowledge event only on success
+        _ = await self.cache.execute_staged_invalidations(self.db, events)

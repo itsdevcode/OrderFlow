@@ -294,15 +294,24 @@ OrderFlow adopts a **Post-Commit Versioned Namespace Invalidation** strategy:
 5. **In-Flight Query Race Guard**:
    - When serving listing requests (`list_products`, `list_categories`), the service reads the namespace version before executing the database query and re-verifies `v_after == version` prior to writing to Redis (`cache.set`). If a concurrent mutation bumped the version while the database query was in-flight, the potentially stale query result is discarded rather than cached.
 
-### 🛡️ Resilience & Multi-Worker Outage Recovery
+### 🛡️ Resilience, Atomic Invalidation & Multi-Worker Outage Recovery
 
-- **Optional Startup**: Redis unavailability never prevents application startup. If unreachable, the service logs a sanitized warning and boots in degraded mode.
-- **Fail-Open Reads**: When Redis is down, reads seamlessly fall back to PostgreSQL with zero HTTP 500 errors.
-- **Fail-Safe Writes**: A Redis failure during cache invalidation never rolls back an already-committed database transaction.
-- **Multi-Worker Outage Consistency**:
-  - When Redis is down or unreachable during a committed database mutation, the failed invalidations (detail keys and namespaces) are durably recorded in the PostgreSQL table `cache_pending_invalidations`.
-  - When Redis connectivity recovers, any API worker process handling subsequent catalog reads executes `sync_pending_invalidations(db)`.
-  - Concurrency between multiple API workers is coordinated safely via `SELECT ... ORDER BY id LIMIT 100 FOR UPDATE`.
+- **Atomic Invalidation Intent (Transactional Outbox Pattern)**:
+  - Durable cache-invalidation events (`CachePendingInvalidation`) are persisted in PostgreSQL in the **exact same transaction** as each Product/Category mutation.
+  - The business entity change and the cache invalidation intent commit atomically. If the database transaction rolls back, no invalidation intent is recorded.
+  - After commit, the application attempts Redis cache invalidation (`execute_staged_invalidations`).
+  - Pending events are removed/acknowledged from PostgreSQL **only after Redis invalidation operations succeed**.
+  - If the process crashes or Redis is unreachable before invalidation completes, the pending event is retained in PostgreSQL for recovery.
+- **Fail-Safe Reconciliation & Stale-Read Prevention**:
+  - `sync_pending_invalidations(db)` returns an explicit boolean result (`True` for success/no pending events, `False` on reconciliation failure or outage).
+  - If pending invalidations cannot be reconciled (e.g. Redis remains down or DB locks fail), the catalog read (`get_product`, `list_products`, `get_category`, `list_categories`) **bypasses Redis entirely** for that request and reads directly from PostgreSQL.
+  - This strictly prevents stale Redis entries from being served while unresolved invalidations may affect the catalog.
+- **Startup Recovery & Bounded Reconnect Strategy**:
+  - When Redis is unavailable during application startup, FastAPI lifespan logs a sanitized warning and boots in degraded mode with zero crashes.
+  - Redis is **never mandatory** for normal API availability (`/health`, `/health/db`, and catalog endpoints operate seamlessly via PostgreSQL fallback).
+  - The cache layer implements a bounded reconnect strategy (`ensure_connected` with a 5-second `reconnect_cooldown`). It bypasses connection attempts during cooldown to eliminate repeated socket timeout latency on client request threads, while automatically reconnecting and exiting degraded mode once Redis recovers without requiring application restarts.
+- **Multi-Worker Concurrency Coordination**:
+  - Concurrency between multiple API workers reconciling pending events is coordinated safely via `SELECT ... ORDER BY id LIMIT 100 FOR UPDATE`.
   - The recovering worker purges dirty keys and bumps namespace versions in Redis before serving the read, and deletes the reconciled database records only upon verified Redis success.
   - This architecture ensures that **recovered Redis can never serve known-stale cache entries across multiple worker processes**.
 - **Circuit Breaker Cooldown**: When a Redis connection timeout occurs, an internal circuit breaker triggers a cooldown period (default: 5 seconds). During cooldown, Redis is bypassed instantly without making network calls, preventing repeated socket timeout latency on client requests.
@@ -314,7 +323,9 @@ OrderFlow adopts a **Post-Commit Versioned Namespace Invalidation** strategy:
 In accordance with the CAP theorem and distributed systems design, Redis is an auxiliary, cache-aside read optimization layer, while PostgreSQL is the single authoritative source of truth. The following unavoidable consistency bounds apply:
 
 1. **Transient Outage Window**:
-   - If Redis becomes unreachable during a mutation, the pending invalidation is persisted in PostgreSQL.
+   - Durable invalidation intent is committed atomically with mutations in PostgreSQL.
+   - If Redis is unreachable, pending invalidations remain safely in PostgreSQL, and all subsequent catalog reads bypass Redis to fetch fresh data directly from PostgreSQL.
+   - When Redis recovers, the very next read request through any API worker executes pending synchronization before reading or serving cache data, restoring consistency.
    - During the outage, reads fall back directly to PostgreSQL and receive fresh data.
    - If Redis recovers, the very next read request through any API worker executes pending synchronization before reading or serving cache data, restoring consistency.
 2. **TTL as an Absolute Staleness Upper Bound**:

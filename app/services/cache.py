@@ -357,14 +357,14 @@ class CacheService:
         event_ids: list[int] = [e.id for e in events]
 
         try:
-            if keys_to_del:
-                del_res = await self.delete_many(*keys_to_del)
-                if del_res < 0:
+            for key in keys_to_del:
+                del_res = await self.delete(key)
+                if not del_res:
                     return False
 
             for ns in namespaces_to_bump:
                 val = await self.bump_version(ns)
-                if val <= 1 and not self.is_available:
+                if val <= 1 or not self.is_available:
                     return False
 
             if event_ids:
@@ -428,7 +428,7 @@ class CacheService:
 
                 for ns in namespaces_to_bump:
                     val = await self.bump_version(ns)
-                    if val <= 1 and not self.is_available:
+                    if val <= 1 or not self.is_available:
                         await db.rollback()
                         return False
 
@@ -450,30 +450,59 @@ class CacheService:
     async def invalidate_product(
         self,
         product_id: int,
-        _db: AsyncSession | None = None,
+        db: AsyncSession | None = None,
     ) -> None:
         """
         Invalidates product detail cache and bumps product listings version.
         Maintained for backwards-compatibility or explicit post-commit invalidation calls.
+        If db is provided and Redis is unavailable, stages/persists durable invalidation.
         """
         detail_key = self.build_key("products", "detail", str(product_id))
-        _ = await self.delete(detail_key)
-        _ = await self.bump_version("products")
+        del_ok = await self.delete(detail_key)
+        bump_val = await self.bump_version("products")
+        bump_ok = bump_val > 1 and self.is_available
+
+        if settings.cache_enabled and (not del_ok or not bump_ok) and db is not None:
+            try:
+                event = CachePendingInvalidation(key=detail_key, namespace="products")
+                db.add(event)
+                await db.commit()
+            except Exception:
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
 
     async def invalidate_category(
         self,
         category_id: int,
-        _db: AsyncSession | None = None,
+        db: AsyncSession | None = None,
     ) -> None:
         """
         Invalidates category detail cache, category listings version,
         and product listings version.
         Maintained for backwards-compatibility or explicit post-commit invalidation calls.
+        If db is provided and Redis is unavailable, stages/persists durable invalidation.
         """
         detail_key = self.build_key("categories", "detail", str(category_id))
-        _ = await self.delete(detail_key)
-        _ = await self.bump_version("categories")
-        _ = await self.bump_version("products")
+        del_ok = await self.delete(detail_key)
+        bump_cat_val = await self.bump_version("categories")
+        bump_cat_ok = bump_cat_val > 1 and self.is_available
+        bump_prod_val = await self.bump_version("products")
+        bump_prod_ok = bump_prod_val > 1 and self.is_available
+
+        if settings.cache_enabled and (not del_ok or not bump_cat_ok or not bump_prod_ok) and db is not None:
+            try:
+                event1 = CachePendingInvalidation(key=detail_key, namespace="categories")
+                event2 = CachePendingInvalidation(namespace="products")
+                db.add(event1)
+                db.add(event2)
+                await db.commit()
+            except Exception:
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
 
 
 _default_cache_service: CacheService | None = None

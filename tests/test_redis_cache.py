@@ -1192,4 +1192,223 @@ async def test_read_version_db_query_cache_set_race_guard(
     assert cached is None
 
 
+# ==============================================================================
+# Fix 1 & 2 & 3: Crash Recovery, Fail-Safe Reconciliation & Startup Resilience
+# ==============================================================================
+
+
+async def test_simulated_crash_between_commit_and_redis_invalidation(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+    db_session: AsyncSession,
+) -> None:
+    """
+    Fix 1 Regression Test:
+    Simulates a process crash immediately following PostgreSQL commit
+    (before execute_staged_invalidations is called or can acknowledge).
+    1. Product and invalidation intent are committed atomically in PostgreSQL.
+    2. Process crashes before Redis invalidation can succeed.
+    3. Pending event is durably retained in PostgreSQL.
+    4. Subsequent request by an independent worker reconciles the event,
+       purges the stale Redis entry, serves fresh DB data, and clears the pending event.
+    """
+    from unittest.mock import patch
+
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    cache = get_cache_service()
+    redis = cache.client
+    assert redis is not None
+
+    # Step 1: Create category and product
+    cat_resp = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "CrashCat", "slug": "crash-cat"})
+    cat_id: int = cast(int, cat_resp.json()["id"])
+    prod_resp = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "CrashProd", "slug": "crash-prod", "sku": "SKU-CRASH", "price": 50.0, "category_id": cat_id
+    })
+    prod_id: int = cast(int, prod_resp.json()["id"])
+    detail_key = cache.build_key("products", "detail", str(prod_id))
+
+    # Warm cache
+    warm_resp = await client.get(f"/api/v1/products/{prod_id}", headers=customer_headers)
+    assert warm_resp.status_code == 200
+    assert warm_resp.json()["price"] == "50.00"
+    assert await redis.get(detail_key) is not None
+
+    # Step 2: Simulate process crash between commit and Redis invalidation
+    with patch.object(cache, "execute_staged_invalidations", side_effect=RuntimeError("Simulated SIGKILL / process crash")):
+        with pytest.raises(RuntimeError, match="Simulated SIGKILL"):
+            _ = await client.patch(
+                f"/api/v1/products/{prod_id}",
+                headers=admin_headers,
+                json={"price": 75.0},
+            )
+
+    # Step 3: Verify PostgreSQL state:
+    # Mutation was committed atomically with the durable pending invalidation intent!
+    db_prod = (await db_session.execute(select(Product).where(Product.id == prod_id))).scalar_one()
+    assert db_prod.price == Decimal("75.00")
+
+    check_stmt = select(CachePendingInvalidation).where(CachePendingInvalidation.key == detail_key)
+    pending_records = (await db_session.execute(check_stmt)).scalars().all()
+    assert len(pending_records) >= 1
+    assert pending_records[0].key == detail_key
+
+    # Redis still contains stale pre-crash value because invalidation was interrupted by crash
+    raw_stale = await redis.get(detail_key)
+    assert raw_stale is not None
+    assert "50.0" in str(raw_stale)
+
+    # Step 4: Recovery on subsequent request (simulating independent worker)
+    # The subsequent read invokes sync_pending_invalidations, purging stale Redis data
+    recov_resp = await client.get(f"/api/v1/products/{prod_id}", headers=customer_headers)
+    assert recov_resp.status_code == 200
+    assert recov_resp.json()["price"] == "75.00"
+
+    # Verify Redis is updated with the fresh value
+    raw_updated = await redis.get(detail_key)
+    assert raw_updated is not None
+    assert "75.0" in str(raw_updated)
+
+    # Verify pending invalidation table in PostgreSQL was acknowledged and cleared
+    pending_after = (await db_session.execute(check_stmt)).scalars().all()
+    assert len(pending_after) == 0
+
+
+async def test_fail_safe_reconciliation_bypasses_redis_on_failure(
+    client: AsyncClient,
+    admin_user: User,
+    customer_user: User,
+    db_session: AsyncSession,
+) -> None:
+    """
+    Fix 2 Regression Test:
+    1. Warm cache with product detail.
+    2. Simulate an unresolved invalidation intent persisted in PostgreSQL.
+    3. Simulate PostgreSQL reconciliation failure in sync_pending_invalidations (returning False).
+    4. Assert that Redis is completely bypassed for the request and PostgreSQL is read directly.
+    5. Assert stale Redis entries are NOT served while unresolved invalidations exist.
+    6. Verify that once reconciliation succeeds, Redis is updated and pending events are cleared.
+    """
+    from unittest.mock import patch
+
+    admin_token = await login_and_get_access_token(client, admin_user.email, "AdminPassword123!")
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    cache = get_cache_service()
+    redis = cache.client
+    assert redis is not None
+
+    # Step 1: Create category and product, warm cache
+    cat_resp = await client.post("/api/v1/categories", headers=admin_headers, json={"name": "ReconcileCat", "slug": "reconcile-cat"})
+    cat_id: int = cast(int, cat_resp.json()["id"])
+    prod_resp = await client.post("/api/v1/products", headers=admin_headers, json={
+        "name": "ReconcileProd", "slug": "reconcile-prod", "sku": "SKU-REC", "price": 100.0, "category_id": cat_id
+    })
+    prod_id: int = cast(int, prod_resp.json()["id"])
+    detail_key = cache.build_key("products", "detail", str(prod_id))
+
+    warm_resp = await client.get(f"/api/v1/products/{prod_id}", headers=customer_headers)
+    assert warm_resp.status_code == 200
+    assert warm_resp.json()["price"] == "100.00"
+
+    # Step 2: Directly update product in DB to 125.0 and record pending invalidation
+    await db_session.execute(
+        update(Product).where(Product.id == prod_id).values(price=Decimal("125.00"))
+    )
+    pending_event = CachePendingInvalidation(key=detail_key, namespace="products")
+    db_session.add(pending_event)
+    await db_session.commit()
+
+    # Redis still has stale "100.00"
+    stale_in_redis = await redis.get(detail_key)
+    assert stale_in_redis is not None
+    assert "100.0" in str(stale_in_redis)
+
+    # Step 3: Simulate failure in sync_pending_invalidations (e.g. PostgreSQL lock or query failure)
+    with patch.object(cache, "sync_pending_invalidations", return_value=False):
+        # Step 4 & 5: Request must bypass Redis and read fresh PostgreSQL state (125.00)
+        # NEVER serving the stale 100.00 entry in Redis!
+        read_resp = await client.get(f"/api/v1/products/{prod_id}", headers=customer_headers)
+        assert read_resp.status_code == 200
+        assert read_resp.json()["price"] == "125.00"
+
+        # Also verify listing bypasses Redis when sync fails
+        list_resp = await client.get("/api/v1/products", headers=customer_headers)
+        assert list_resp.status_code == 200
+        matched = [p for p in list_resp.json() if p["id"] == prod_id]
+        assert len(matched) == 1
+        assert matched[0]["price"] == "125.00"
+
+    # Step 6: When reconciliation succeeds, sync executes and updates Redis
+    recov_resp = await client.get(f"/api/v1/products/{prod_id}", headers=customer_headers)
+    assert recov_resp.status_code == 200
+    assert recov_resp.json()["price"] == "125.00"
+
+    # Assert pending event in PostgreSQL is now acknowledged and deleted
+    check_stmt = select(CachePendingInvalidation).where(CachePendingInvalidation.key == detail_key)
+    pending_after = (await db_session.execute(check_stmt)).scalars().all()
+    assert len(pending_after) == 0
+
+
+async def test_startup_recovery_with_redis_unavailable_and_bounded_reconnect(
+    client: AsyncClient,
+    customer_user: User,
+) -> None:
+    """
+    Fix 3 Regression Test:
+    1. Simulates Redis being completely offline during FastAPI lifespan startup.
+    2. Verifies application starts successfully in degraded mode with zero crashes.
+    3. Verifies normal API availability (/health, /api/v1/products with auth).
+    4. Verifies bounded reconnect strategy does not repeatedly block requests during cooldown.
+    5. Verifies automatic reconnection when Redis becomes reachable after cooldown.
+    """
+    import time
+    import redis.asyncio as aioredis
+    from unittest.mock import patch
+    from redis.exceptions import ConnectionError as RedisConnError
+
+    customer_token = await login_and_get_access_token(client, customer_user.email, "CustomerPassword123!")
+    customer_headers = {"Authorization": f"Bearer {customer_token}"}
+
+    # 1. Simulate Redis completely offline during startup lifespan
+    orig_client = get_redis_client()
+    try:
+        set_redis_client(None)
+        with patch.object(aioredis, "from_url", side_effect=RedisConnError("Cannot connect to Redis host")):
+            async with lifespan(fastapi_app):
+                # Startup succeeded without exception
+                assert get_redis_client() is None
+
+                # 2. Normal API availability without Redis
+                health_resp = await client.get("/health")
+                assert health_resp.status_code == 200
+                assert health_resp.json() == {"status": "ok"}
+
+                prods_resp = await client.get("/api/v1/products", headers=customer_headers)
+                assert prods_resp.status_code == 200
+
+                # 3. Test bounded reconnect strategy:
+                # During cooldown, ensure_connected returns None without making network attempts
+                cache_instance = CacheService(reconnect_cooldown=5.0)
+                cache_instance._last_reconnect_time = time.monotonic()
+                assert await cache_instance.ensure_connected() is None
+
+        # 4. Once cooldown elapses and Redis is available, ensure_connected reconnects
+        recovered_cache = CacheService(reconnect_cooldown=0.0)
+        recovered_client = await recovered_cache.ensure_connected()
+        assert recovered_client is not None
+        assert await recovered_client.ping() is True
+    finally:
+        set_redis_client(orig_client)
+
+
+
+
 

@@ -39,7 +39,9 @@ class CategoryService:
                 description=data.description,
             )
 
-            # Transaction owned by service
+            # Persist durable cache-invalidation event in the same transaction
+            events = self.cache.stage_category_invalidation(self.db, category.id)
+            # Commit both atomically
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
@@ -47,8 +49,8 @@ class CategoryService:
                 "Category name or slug already exists"
             ) from exc
 
-        # Invalidate listing caches after successful commit
-        await self.cache.invalidate_category(category.id, db=self.db)
+        # After commit, attempt Redis invalidation; acknowledge event only on success
+        _ = await self.cache.execute_staged_invalidations(self.db, events)
 
         return category
 
@@ -66,7 +68,10 @@ class CategoryService:
         attempts Redis lookup, falls back to PostgreSQL on miss or failure,
         and serializes validated response to Redis with bounded TTL.
         """
-        await self.cache.sync_pending_invalidations(self.db)
+        sync_ok = await self.cache.sync_pending_invalidations(self.db)
+        if not sync_ok:
+            category = await self.get_category_model(category_id)
+            return CategoryResponse.model_validate(category)
 
         cache_key = self.cache.build_key("categories", "detail", str(category_id))
         cached_data = await self.cache.get(cache_key)
@@ -92,7 +97,10 @@ class CategoryService:
         Uses versioned namespace keys to enable O(1) bulk invalidation without Redis KEYS.
         Rejects entire cached list if any item is malformed or invalid to prevent partial data.
         """
-        await self.cache.sync_pending_invalidations(self.db)
+        sync_ok = await self.cache.sync_pending_invalidations(self.db)
+        if not sync_ok:
+            categories = await self.category_repo.list(offset=offset, limit=limit)
+            return [CategoryResponse.model_validate(c) for c in categories]
 
         version = await self.cache.get_version("categories")
         cache_key = self.cache.build_key(
@@ -155,13 +163,14 @@ class CategoryService:
 
         try:
             updated_category = await self.category_repo.update(category, **changes)
+            events = self.cache.stage_category_invalidation(self.db, category_id)
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
             raise CategoryAlreadyExistsError("Category name or slug already exists") from exc
 
-        # Invalidate affected category and product caches after successful commit
-        await self.cache.invalidate_category(category_id, db=self.db)
+        # After commit, attempt Redis invalidation; acknowledge event only on success
+        _ = await self.cache.execute_staged_invalidations(self.db, events)
 
         return updated_category
 
@@ -170,6 +179,7 @@ class CategoryService:
         category_name = category.name
         try:
             await self.category_repo.delete(category)
+            events = self.cache.stage_category_invalidation(self.db, category_id)
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
@@ -177,5 +187,5 @@ class CategoryService:
                 f"Cannot delete category '{category_name}' as it has associated products"
             ) from exc
 
-        # Invalidate affected category and product caches after successful commit
-        await self.cache.invalidate_category(category_id, db=self.db)
+        # After commit, attempt Redis invalidation; acknowledge event only on success
+        _ = await self.cache.execute_staged_invalidations(self.db, events)
