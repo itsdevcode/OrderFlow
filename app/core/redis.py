@@ -44,8 +44,8 @@ async def init_redis_client() -> Redis | None:
     """
     global _redis_client
 
-    if not settings.cache_enabled:
-        logger.info("Redis cache is disabled via settings (CACHE_ENABLED=False).")
+    if not (settings.cache_enabled or settings.rate_limit_enabled):
+        logger.info("Redis consumers are disabled via settings.")
         return None
 
     sanitized_url = sanitize_redis_url(settings.redis_url)
@@ -69,7 +69,7 @@ async def init_redis_client() -> Redis | None:
         except (RedisError, OSError, asyncio.TimeoutError) as exc:
             sanitized_err = sanitize_log_message(str(exc))
             logger.warning(
-                "Redis connection failed at %s (%s: %s). Application running in degraded mode with cache disabled.",
+                "Redis connection failed at %s (%s: %s). Application running in degraded mode with Redis unavailable.",
                 sanitized_url,
                 exc.__class__.__name__,
                 sanitized_err,
@@ -108,7 +108,7 @@ async def ensure_redis_connected(cooldown_seconds: float = 5.0) -> Redis | None:
     """
     global _redis_client, _last_reconnect_attempt
 
-    if not settings.cache_enabled:
+    if not (settings.cache_enabled or settings.rate_limit_enabled):
         return None
 
     if _redis_client is not None:

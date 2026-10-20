@@ -1,6 +1,7 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.dependencies.database import DbSession
+from app.dependencies.rate_limit import limit_login, limit_refresh
 from app.exceptions.auth import (
     InactiveUserError,
     InvalidCredentialsError,
@@ -19,6 +20,7 @@ router = APIRouter(
 
 @router.post(
     "/login",
+    dependencies=[Depends(limit_login)],
     response_model=TokenResponse,
 )
 async def login(
@@ -48,6 +50,7 @@ async def login(
 
 @router.post(
     "/refresh",
+    dependencies=[Depends(limit_refresh)],
     response_model=TokenResponse,
 )
 async def refresh(

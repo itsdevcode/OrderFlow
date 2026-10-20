@@ -16,7 +16,7 @@ from app.db.session import get_db
 from app.main import app as fastapi_app
 
 from app.core.config import settings
-from app.core.redis import init_redis_client
+from app.core.redis import close_redis_client, get_redis_client, init_redis_client
 from app.core.roles import RoleName
 from app.core.security import hash_password
 from app.models.role import Role
@@ -67,11 +67,18 @@ async def setup_redis() -> AsyncGenerator[None, None]:
 
     yield
 
-    if client is not None:
+    # Redis sockets belong to the function-scoped pytest event loop. Never
+    # reuse them in another test's loop (especially with concurrent requests).
+    current = get_redis_client()
+    if current is not None:
         try:
-            _ = await client.flushdb()
+            _ = await current.flushdb()
         except Exception:
             pass
+    await close_redis_client()
+    if client is not None and client is not current:
+        await client.aclose()
+
 
 
 @pytest_asyncio.fixture

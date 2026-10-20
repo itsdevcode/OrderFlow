@@ -117,7 +117,7 @@ python -m app.scripts.seed
 Start the development server using **Uvicorn**:
 
 ```bash
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --no-proxy-headers
 ```
 
 The API will be available at `http://127.0.0.1:8000`.
@@ -369,3 +369,31 @@ pyright
 ## 📜 License
 
 This project is licensed under the MIT License.
+
+## Redis-backed API rate limiting
+
+Login, refresh, and payment webhooks use atomic fixed windows shared across API workers through the existing Redis pool. Catalog reads, logout, and authenticated account reads have no new limits. Logout remains available to revoke a session even when Redis is unavailable. These pre-authentication endpoints use a client address; neither an unverified JWT nor a supplied email changes its bucket. The limiter service also accepts verified `user:<id>` identities for future authenticated policies; this PR adds no such endpoint policy.
+
+| Endpoint | Default requests/window per address | Redis outage policy |
+| --- | --- | --- |
+| `POST /api/v1/auth/login` | 10 / 60 seconds | 503; do not verify credentials or issue tokens |
+| `POST /api/v1/auth/refresh` | 30 / 60 seconds | 503; do not rotate or revoke tokens |
+| `POST /api/v1/webhooks/payments` | 120 / 60 seconds | Continue through mandatory HMAC verification, payload bounds, timestamp/replay checks, and PostgreSQL idempotency |
+
+Exceeded limits return `429 {"detail":"Rate limit exceeded"}` with `Retry-After` rounded up to the next window boundary in seconds. Authentication outages return `503 {"detail":"Authentication temporarily unavailable"}` and `Retry-After: 5`. The limiter never accesses a database session. Normal authentication errors remain 401/403 below the threshold; an exhausted bucket returns 429 before business processing. Webhook limits include unsigned attempts while Redis is healthy. Providers must retry 429 responses after `Retry-After`.
+
+Each Lua invocation reads Redis `TIME`, computes the UTC epoch-aligned window `[floor(time/window)*window, next boundary)`, and atomically checks/updates a capped counter with an absolute expiry at the boundary. At the exact boundary a new window starts. Denials do not extend the expiry. Worker clocks are irrelevant. Keys include a version, fixed endpoint scope, window duration, and SHA-256 of the canonical identity; tokens, passwords, emails, and raw addresses are absent. Counter keys expire automatically. Redis must allow `EVAL`, `TIME`, `HGET`, `HSET`, and `PEXPIREAT` for these keys.
+
+`RATE_LIMIT_ENABLED` defaults to true. Limits and windows are configured separately with the `RATE_LIMIT_LOGIN_*`, `RATE_LIMIT_REFRESH_*`, and `RATE_LIMIT_WEBHOOK_*` settings in `.env.example`. Limits must be 1–1,000,000 and windows 1–86,400 seconds. Disabling catalog caching does not disable the Redis pool or security limits. Either Redis consumer keeps the existing pool enabled. Failed checks use a per-worker five-second cooldown; startup connection failure and later recovery use the shared bounded reconnect mechanism. There is no in-memory fallback counter that could be bypassed by switching workers.
+
+### Client addresses and proxy deployment
+
+The default identity is the ASGI socket peer, with IPv4-mapped IPv6 normalized to IPv4. `X-Forwarded-For` is ignored unless the socket peer belongs to `RATE_LIMIT_TRUSTED_PROXIES`, a JSON array of explicit IPs/CIDRs, for example `["10.20.0.5/32"]`. With a trusted peer the chain is walked right-to-left until the first untrusted address. Duplicate, malformed, oversized (over 4096 characters), or overly long (over 32 hops) headers fall back to the peer bucket. `Forwarded` and `X-Real-IP` do not influence identity. A missing/invalid peer uses one conservative shared bucket.
+
+Run Uvicorn with **`--no-proxy-headers`**, e.g. `uvicorn app.main:app --no-proxy-headers`, so middleware cannot replace the actual peer before application trust checks. Configure trusted proxies here, restrict direct access to the backend, and make each trusted proxy append the real connecting client address or overwrite client-supplied headers. Never configure all Internet addresses as trusted proxies. An ASGI server that rewrites the peer upstream is outside this application's trust boundary.
+
+### Security tradeoffs and limits
+
+A fixed window permits up to twice the configured limit around a boundary. This is acceptable for the initial coarse abuse guard; endpoint-specific thresholds, password verification, token validation, and webhook signatures remain essential. Per-address limits can affect users behind the same NAT and do not stop distributed attacks or IPv6 address rotation. The webhook fail-open policy prioritizes provider delivery during Redis outages; existing signature verification and idempotency still apply, while infrastructure-level request/body limits remain necessary against volumetric attacks. Authentication intentionally sacrifices availability when the limiter is unavailable.
+
+Redis eviction, data loss, or failover can reset counters. Use adequate capacity and an eviction policy that preserves security counters (prefer `noeviction`), monitor Redis errors, and size/tune thresholds for real provider traffic and shared client networks. Windows use Redis wall time, so Redis clock jumps affect boundaries. This is an application abuse guard, not a durable quota or a DDoS protection system. Changing the window duration starts a new counter namespace; changing limits mid-window applies the new threshold to the existing count.

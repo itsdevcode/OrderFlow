@@ -1,6 +1,7 @@
-from fastapi import APIRouter, BackgroundTasks, Header, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Request, status
 from app.core.config import settings
 from app.dependencies.database import DbSession
+from app.dependencies.rate_limit import limit_payment_webhook
 from app.exceptions.webhook import WebhookPayloadTooLargeError
 from app.schemas.webhook import WebhookResponse
 from app.services.payment_webhook import PaymentWebhookService
@@ -10,6 +11,7 @@ router = APIRouter(prefix="/webhooks/payments", tags=["Webhooks"])
 
 @router.post(
     "",
+    dependencies=[Depends(limit_payment_webhook)],
     response_model=WebhookResponse,
     status_code=status.HTTP_200_OK,
     summary="Process Payment Webhook",
