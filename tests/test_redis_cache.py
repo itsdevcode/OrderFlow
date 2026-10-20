@@ -58,6 +58,7 @@ async def test_redis_client_lifespan() -> None:
 
 
 def test_credential_and_url_sanitization() -> None:
+    assert "secret" not in sanitize_log_message("redis://:secret@localhost/0")
     """Verifies Redis URLs and log messages mask credentials to prevent secret leakage."""
     assert (
         sanitize_redis_url("redis://:super_secret_password@localhost:6379/0")
@@ -964,8 +965,7 @@ async def test_redis_outage_invalidation_failure_and_multi_worker_recovery(
 
     # Step 2 & 3: Simulate Redis outage during committed DB mutation.
     # We patch CacheService.delete and bump_version to raise a RedisError during update
-    with patch.object(cache, "delete", side_effect=RedisConnError("Redis connection lost")), \
-         patch.object(cache, "bump_version", side_effect=RedisConnError("Redis connection lost")):
+    with patch.object(real_redis, "eval", side_effect=RedisConnError("Redis connection lost")):
         update_resp = await client.patch(
             f"/api/v1/products/{prod_id}",
             headers=admin_headers,
@@ -1412,3 +1412,179 @@ async def test_startup_recovery_with_redis_unavailable_and_bounded_reconnect(
 
 
 
+
+
+async def test_outbox_rollback_and_commit_are_atomic(db_session: AsyncSession) -> None:
+    from tests.conftest import TestSessionLocal
+    from app.repositories.cache_invalidation import CacheInvalidationRepository
+
+    category = Category(name="Atomic", slug="atomic")
+    db_session.add(category)
+    await db_session.flush()
+    await CacheInvalidationRepository(db_session).stage(namespace="categories")
+    async with TestSessionLocal() as observer:
+        assert (await observer.execute(select(Category))).scalars().all() == []
+        assert (await observer.execute(select(CachePendingInvalidation))).scalars().all() == []
+    await db_session.rollback()
+    assert (await db_session.execute(select(Category))).scalars().all() == []
+    assert (await db_session.execute(select(CachePendingInvalidation))).scalars().all() == []
+    db_session.add(Category(name="Committed", slug="committed"))
+    await CacheInvalidationRepository(db_session).stage(namespace="categories")
+    await db_session.commit()
+    async with TestSessionLocal() as observer:
+        assert len((await observer.execute(select(Category))).scalars().all()) == 1
+        assert len((await observer.execute(select(CachePendingInvalidation))).scalars().all()) == 1
+
+
+async def test_reconciliation_independent_workers_and_ack_replay(db_session: AsyncSession) -> None:
+    from unittest.mock import patch
+    from tests.conftest import TestSessionLocal
+    from app.repositories.cache_invalidation import CacheInvalidationRepository
+    from app.services.cache import ReconciliationOutcome
+
+    cache = get_cache_service()
+    cache._record_success()
+    await CacheInvalidationRepository(db_session).stage(namespace="products")
+    await db_session.commit()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = cache._invalidate_batch
+
+    async def pause(batch: list[CachePendingInvalidation]) -> bool:
+        entered.set()
+        await release.wait()
+        return await original(batch)
+
+    async with TestSessionLocal() as worker:
+        with patch.object(cache, "_invalidate_batch", side_effect=pause):
+            task = asyncio.create_task(cache.sync_pending_invalidations(worker))
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            try:
+                assert await cache.sync_pending_invalidations(db_session) == ReconciliationOutcome.FAILED
+            finally:
+                release.set()
+                assert await task == ReconciliationOutcome.SUCCESS
+
+    await CacheInvalidationRepository(db_session).stage(namespace="products")
+    await db_session.commit()
+    version = await cache.get_version("products")
+    with patch.object(CacheInvalidationRepository, "acknowledge_batch", side_effect=RuntimeError("ack failed")):
+        assert await cache.sync_pending_invalidations(db_session) == ReconciliationOutcome.FAILED
+    assert await cache.get_version("products") > version
+    assert len((await db_session.execute(select(CachePendingInvalidation))).scalars().all()) == 1
+    # Expire lease deterministically; replay repeats safe deletion/version advancement.
+    assert await cache.sync_pending_invalidations(db_session, lease_seconds=0) == ReconciliationOutcome.SUCCESS
+    assert (await db_session.execute(select(CachePendingInvalidation))).scalars().all() == []
+
+
+@pytest.mark.parametrize("namespace", ["products", "categories"])
+async def test_atomic_population_fence(namespace: str) -> None:
+    from app.models.cache_invalidation import CachePendingInvalidation
+    cache = get_cache_service()
+    cache._record_success()
+    key = cache.build_key(namespace, "detail", "123")
+    version = await cache.get_version(namespace)
+    assert await cache.set_if_version(key, {"old": True}, namespace, version)
+    assert await cache._invalidate_batch([CachePendingInvalidation(key=key, namespace=namespace)])
+    assert not await cache.set_if_version(key, {"old": True}, namespace, version)
+    assert await cache.get(key) is None
+
+
+@pytest.mark.parametrize("service_name", ["product", "category"])
+async def test_failed_reconciliation_never_gets_or_sets_cache(db_session: AsyncSession, service_name: str) -> None:
+    from unittest.mock import AsyncMock, patch
+    from app.services.product import ProductService
+    from app.services.category import CategoryService
+    from app.services.cache import ReconciliationOutcome
+    cache = get_cache_service()
+    service = ProductService(db_session, cache) if service_name == "product" else CategoryService(db_session, cache)
+    with patch.object(cache, "sync_pending_invalidations", return_value=ReconciliationOutcome.FAILED), \
+         patch.object(cache, "get", new_callable=AsyncMock) as get, \
+         patch.object(cache, "set_if_version", new_callable=AsyncMock) as put:
+        if service_name == "product":
+            assert await service.list_products() == []
+        else:
+            assert await service.list_categories() == []
+        get.assert_not_awaited()
+        put.assert_not_awaited()
+
+
+async def test_reconciliation_does_not_commit_caller_work(db_session: AsyncSession) -> None:
+    cache = get_cache_service()
+    db_session.add(Category(name="Caller", slug="caller"))
+    await cache.sync_pending_invalidations(db_session)
+    await db_session.rollback()
+    assert (await db_session.execute(select(Category))).scalars().all() == []
+
+
+async def test_service_staging_failure_rolls_back_business_change(db_session: AsyncSession) -> None:
+    from unittest.mock import patch
+    from tests.conftest import TestSessionLocal
+    from app.schemas.category import CategoryCreate
+    from app.services.category import CategoryService
+    cache = get_cache_service()
+    original = cache.stage_category_invalidation
+
+    async def fail_after_staging(db: AsyncSession, category_id: int) -> list[CachePendingInvalidation]:
+        await original(db, category_id)
+        raise RuntimeError("forced transaction rollback")
+
+    with patch.object(cache, "stage_category_invalidation", side_effect=fail_after_staging):
+        with pytest.raises(RuntimeError, match="forced transaction rollback"):
+            await CategoryService(db_session, cache).create_category(CategoryCreate(name="Rollback", slug="rollback"))
+    async with TestSessionLocal() as observer:
+        assert (await observer.execute(select(Category))).scalars().all() == []
+        assert (await observer.execute(select(CachePendingInvalidation))).scalars().all() == []
+
+
+async def test_catalog_write_rejects_caller_transaction(db_session: AsyncSession) -> None:
+    from app.schemas.category import CategoryCreate
+    from app.services.category import CategoryService
+    async with db_session.begin():
+        with pytest.raises(RuntimeError, match="service-owned"):
+            await CategoryService(db_session).create_category(CategoryCreate(name="Owned", slug="owned"))
+    assert (await db_session.execute(select(Category))).scalars().all() == []
+
+
+async def test_detail_reader_cannot_populate_after_concurrent_invalidation(db_session: AsyncSession) -> None:
+    from unittest.mock import patch
+    from app.services.category import CategoryService
+    from app.schemas.category import CategoryCreate
+    cache = get_cache_service()
+    cache._record_success()
+    service = CategoryService(db_session, cache)
+    category = await service.create_category(CategoryCreate(name="Fence", slug="fence"))
+    key = cache.build_key("categories", "detail", str(category.id))
+    original = cache.set_if_version
+
+    async def invalidate_before_population(key: str, value: object, namespace: str, version: int) -> bool:
+        assert await cache._invalidate_batch([CachePendingInvalidation(key=key, namespace=namespace)])
+        return await original(key, value, namespace, version)
+
+    with patch.object(cache, "set_if_version", side_effect=invalidate_before_population):
+        assert (await service.get_category(category.id)).name == "Fence"
+    assert await cache.get(key) is None
+
+
+async def test_catalog_write_does_not_adopt_flushed_caller_work(db_session: AsyncSession) -> None:
+    from app.schemas.category import CategoryCreate
+    from app.services.category import CategoryService
+    db_session.add(Category(name="Caller flushed", slug="caller-flushed"))
+    await db_session.flush()
+    with pytest.raises(RuntimeError, match="service-owned"):
+        await CategoryService(db_session).create_category(CategoryCreate(name="Service", slug="service"))
+    await db_session.rollback()
+    assert (await db_session.execute(select(Category))).scalars().all() == []
+
+
+async def test_disabled_cache_retains_intent_for_future_enablement(db_session: AsyncSession) -> None:
+    from unittest.mock import patch
+    cache = get_cache_service()
+    with patch.object(settings, "cache_enabled", False):
+        events = await cache.stage_product_invalidation(db_session, 123)
+        await db_session.commit()
+        assert len(events) == 1
+        await cache.execute_staged_invalidations(db_session, events)
+        assert len((await db_session.execute(select(CachePendingInvalidation))).scalars().all()) == 1
+    cache._record_success()
+    await cache.sync_pending_invalidations(db_session)
+    assert (await db_session.execute(select(CachePendingInvalidation))).scalars().all() == []

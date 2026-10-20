@@ -9,7 +9,7 @@ from app.models.product import Product
 from app.repositories.category import CategoryRepository
 from app.repositories.product import ProductRepository
 from app.schemas.product import ProductCreate, ProductRead, ProductUpdate
-from app.services.cache import CacheService, get_cache_service
+from app.services.cache import CacheService, ReconciliationOutcome, get_cache_service
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,17 @@ class ProductService:
         self.category_repo: CategoryRepository = CategoryRepository(db)
         self.cache: CacheService = cache or get_cache_service()
 
+    def _check_write_boundary(self) -> None:
+        """Writes own commits; do not adopt explicit or dirty caller transactions."""
+        tx = self.db.sync_session.get_transaction()
+        if (tx is not None and tx.origin.name != "AUTOBEGIN") or (
+            self.db.new or self.db.dirty or self.db.deleted
+            or self.db.info.get("uncommitted_writes", False)
+        ):
+            raise RuntimeError("Catalog writes require a clean, service-owned transaction")
+
     async def create_product(self, data: ProductCreate) -> Product:
+        self._check_write_boundary()
         # Check if category exists
         category = await self.category_repo.get_by_id(data.category_id)
         if not category:
@@ -52,7 +62,7 @@ class ProductService:
             )
 
             # Persist durable cache-invalidation event in the same transaction
-            events = self.cache.stage_product_invalidation(self.db, product.id)
+            events = await self.cache.stage_product_invalidation(self.db, product.id)
             # Commit both atomically
             await self.db.commit()
         except IntegrityError as exc:
@@ -60,6 +70,9 @@ class ProductService:
             raise ProductAlreadyExistsError(
                 "Product SKU or slug already exists"
             ) from exc
+        except Exception:
+            await self.db.rollback()
+            raise
 
         # After commit, attempt Redis invalidation; acknowledge event only on success
         _ = await self.cache.execute_staged_invalidations(self.db, events)
@@ -80,11 +93,12 @@ class ProductService:
         attempts Redis lookup, falls back to PostgreSQL on miss or failure,
         and serializes validated response to Redis with bounded TTL.
         """
-        sync_ok = await self.cache.sync_pending_invalidations(self.db)
-        if not sync_ok:
+        outcome = await self.cache.sync_pending_invalidations(self.db)
+        if outcome != ReconciliationOutcome.SUCCESS:
             product = await self.get_product_model(product_id)
             return ProductRead.model_validate(product)
 
+        version = await self.cache.get_version("products")
         cache_key = self.cache.build_key("products", "detail", str(product_id))
         cached_data = await self.cache.get(cache_key)
         if cached_data is not None and isinstance(cached_data, dict):
@@ -100,7 +114,9 @@ class ProductService:
 
         product = await self.get_product_model(product_id)
         response = ProductRead.model_validate(product)
-        _ = await self.cache.set(cache_key, response.model_dump(mode="json"))
+        v_after = await self.cache.get_version("products")
+        if v_after == version:
+            _ = await self.cache.set_if_version(cache_key, response.model_dump(mode="json"), "products", version)
         return response
 
     async def list_products(
@@ -115,8 +131,8 @@ class ProductService:
         Uses versioned namespace keys to enable O(1) bulk invalidation without Redis KEYS.
         Rejects entire cached list if any item is malformed or invalid to prevent partial data.
         """
-        sync_ok = await self.cache.sync_pending_invalidations(self.db)
-        if not sync_ok:
+        outcome = await self.cache.sync_pending_invalidations(self.db)
+        if outcome != ReconciliationOutcome.SUCCESS:
             products = await self.product_repo.list(
                 offset=offset,
                 limit=limit,
@@ -166,13 +182,15 @@ class ProductService:
         # Only populate cache if the namespace version has not changed during the query
         v_after = await self.cache.get_version("products")
         if v_after == version:
-            _ = await self.cache.set(
+            _ = await self.cache.set_if_version(
                 cache_key,
                 [item.model_dump(mode="json") for item in response_list],
+                "products", version,
             )
         return response_list
 
     async def update_product(self, product_id: int, data: ProductUpdate) -> Product:
+        self._check_write_boundary()
         product = await self.get_product_model(product_id)
 
         changes: dict[str, object] = data.model_dump(exclude_unset=True)
@@ -203,11 +221,14 @@ class ProductService:
 
         try:
             updated_product = await self.product_repo.update(product, **changes)
-            events = self.cache.stage_product_invalidation(self.db, product_id)
+            events = await self.cache.stage_product_invalidation(self.db, product_id)
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
             raise ProductAlreadyExistsError("Product SKU or slug already exists") from exc
+        except Exception:
+            await self.db.rollback()
+            raise
 
         # After commit, attempt Redis invalidation; acknowledge event only on success
         _ = await self.cache.execute_staged_invalidations(self.db, events)
@@ -215,14 +236,18 @@ class ProductService:
         return updated_product
 
     async def delete_product(self, product_id: int) -> None:
+        self._check_write_boundary()
         product = await self.get_product_model(product_id)
         try:
             await self.product_repo.delete(product)
-            events = self.cache.stage_product_invalidation(self.db, product_id)
+            events = await self.cache.stage_product_invalidation(self.db, product_id)
             await self.db.commit()
         except IntegrityError as exc:
             await self.db.rollback()
             raise ProductAlreadyExistsError("Cannot delete product due to database integrity constraints") from exc
+        except Exception:
+            await self.db.rollback()
+            raise
 
         # After commit, attempt Redis invalidation; acknowledge event only on success
         _ = await self.cache.execute_staged_invalidations(self.db, events)
