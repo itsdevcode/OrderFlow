@@ -15,6 +15,8 @@ from app.repositories.user import UserRepository
 from app.repositories.refresh_token import RefreshTokenRepository
 from app.core.jwt import create_access_token, create_refresh_token, decode_token
 from app.schemas.auth import TokenResponse
+from app.models.audit_log import AuditAction
+from app.services.audit import AuditService
 
 class AuthService:
     user_repository: UserRepository
@@ -29,7 +31,11 @@ class AuthService:
         email: str,
         password: str,
     ) -> TokenResponse:
-        user = await self.authenticate(email, password)
+        try:
+            user = await self.authenticate(email, password)
+        except (InvalidCredentialsError, InactiveUserError):
+            await AuditService.record_login_failure()
+            raise
 
         jti = str(uuid.uuid4())
         refresh_token = create_refresh_token(user.id, jti)
@@ -42,7 +48,7 @@ class AuthService:
             expires_at=expires_at,
         )
         await self.refresh_token_repository.create(rt_record)
-        await self.user_repository.db.commit()
+        await self._commit_event(AuditAction.LOGIN_SUCCEEDED, user.id)
 
         return TokenResponse(
             access_token=create_access_token(user.id),
@@ -95,7 +101,7 @@ class AuthService:
 
         if rt_record.is_revoked:
             await self.refresh_token_repository.revoke_all_for_user(user_id)
-            await self.refresh_token_repository.db.commit()
+            await self._commit_event(AuditAction.TOKEN_REUSE_DETECTED, user_id)
             raise InvalidTokenError
 
         user = await self.user_repository.get_by_id(user_id)
@@ -115,7 +121,7 @@ class AuthService:
             expires_at=expires_at,
         )
         await self.refresh_token_repository.create(new_rt_record)
-        await self.refresh_token_repository.db.commit()
+        await self._commit_event(AuditAction.TOKEN_REFRESHED, user.id)
 
         return TokenResponse(
             access_token=create_access_token(user.id),
@@ -147,5 +153,16 @@ class AuthService:
         if rt_record.user_id != user_id:
             raise InvalidTokenError
 
+        if rt_record.is_revoked:
+            return
         await self.refresh_token_repository.revoke(jti)
-        await self.refresh_token_repository.db.commit()
+        await self._commit_event(AuditAction.LOGOUT, user_id)
+
+    async def _commit_event(self, action: AuditAction, user_id: int) -> None:
+        db = self.user_repository.db
+        try:
+            await AuditService(db).stage(action, actor_id=user_id, resource_id=user_id)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise

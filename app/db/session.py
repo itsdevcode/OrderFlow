@@ -14,7 +14,9 @@ from app.core.config import settings
 
 engine = create_async_engine(
     settings.database_url,
-    echo=settings.debug,
+    # SQL parameters can contain credentials and personal information.
+    echo=False,
+    hide_parameters=True,
 )
 
 

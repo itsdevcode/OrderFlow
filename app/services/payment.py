@@ -19,6 +19,8 @@ from app.exceptions.payment import (
     UnsupportedPaymentProviderError,
 )
 from app.models.order import Order, OrderStatus
+from app.models.audit_log import AuditAction
+from app.services.audit import AuditService
 from app.models.payment import Payment, PaymentStatus
 from app.models.user import User
 from app.repositories.payment import PaymentRepository
@@ -245,6 +247,12 @@ class PaymentService:
 
         payment.status = target_status
         await self.db.flush()
+        if target_status in {PaymentStatus.SUCCEEDED, PaymentStatus.FAILED}:
+            await AuditService(self.db).stage(
+                AuditAction.PAYMENT_SUCCEEDED if target_status == PaymentStatus.SUCCEEDED else AuditAction.PAYMENT_FAILED,
+                resource_id=payment.id,
+                metadata={"order_id": payment.order_id, "from_status": current_status.value, "to_status": target_status.value},
+            )
         return payment
 
     async def transition_payment_status(
@@ -265,11 +273,13 @@ class PaymentService:
         if not payment:
             raise PaymentNotFoundError(f"Payment with id {payment_id} not found")
 
-        updated_payment = await self.apply_payment_transition(payment, target_status)
-
-        if auto_commit:
-            await self.db.commit()
-            await self.db.refresh(updated_payment)
-
-        return updated_payment
-
+        try:
+            updated_payment = await self.apply_payment_transition(payment, target_status)
+            if auto_commit:
+                await self.db.commit()
+                await self.db.refresh(updated_payment)
+            return updated_payment
+        except Exception:
+            if auto_commit:
+                await self.db.rollback()
+            raise

@@ -5,6 +5,8 @@ from app.exceptions.cart import ProductNotActiveError
 from app.exceptions.order import EmptyCartError, OrderNotFoundError
 from app.exceptions.product import ProductNotFoundError
 from app.models.order import Order, OrderStatus
+from app.models.audit_log import AuditAction
+from app.services.audit import AuditService
 from app.models.order_item import OrderItem
 from app.repositories.cart import CartRepository
 from app.repositories.order import OrderRepository
@@ -126,6 +128,10 @@ class OrderService:
             )
 
             await self.cart_repo.clear_cart(cart.id)
+            await AuditService(self.db).stage(
+                AuditAction.ORDER_CREATED, actor_id=user_id, resource_id=new_order.id,
+                metadata={"item_count": len(order_items)},
+            )
             await self.db.commit()
 
             if notif and background_tasks is not None:

@@ -5,6 +5,8 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from app.core.config import settings
+from app.core.logging import configure_logging
+from app.middleware.request_context import RequestContextMiddleware
 from app.core.redis import close_redis_client, get_redis_client, init_redis_client
 from app.dependencies.database import DbSession
 from app.api.v1.router import api_router
@@ -12,6 +14,7 @@ from app.api.v1.router import api_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    configure_logging(settings.log_level)
     await init_redis_client()
     try:
         yield
@@ -25,6 +28,8 @@ app = FastAPI(
     description="Production-grade Order & Inventory Management API",
     lifespan=lifespan,
 )
+
+app.add_middleware(RequestContextMiddleware)
 
 app.include_router(
     api_router,
