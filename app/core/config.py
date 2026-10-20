@@ -1,4 +1,4 @@
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from ipaddress import ip_network
 
@@ -6,6 +6,8 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
+    audit_failure_timeout_seconds: float = Field(default=1.0, gt=0, le=5)
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     app_name: str = "OrderFlow API"
     app_version: str = "1.0.0"
     debug: bool = False

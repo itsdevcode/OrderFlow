@@ -39,9 +39,10 @@ async def adjust_stock(
     warehouse_id: PositiveId,
     adjustment: InventoryAdjustment,
     db: DbSession,
+    current_user: CurrentUser,
 ):
     try:
-        return await InventoryService(db).adjust_stock(product_id, warehouse_id, adjustment)
+        return await InventoryService(db).adjust_stock(product_id, warehouse_id, adjustment, actor_id=current_user.id)
     except InsufficientStockError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except ValueError as exc:

@@ -173,6 +173,9 @@ class PaymentWebhookService:
                         message="Event already processed",
                     )
             raise
+        except Exception:
+            await self.db.rollback()
+            raise
 
     async def _execute_webhook_transaction(
         self,
