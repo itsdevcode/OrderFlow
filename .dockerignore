@@ -1,0 +1,16 @@
+# Allow only runtime build inputs; local credentials and tooling never enter context.
+**
+!Dockerfile
+!requirements.txt
+!alembic.ini
+!app/
+!app/**
+!alembic/
+!alembic/**
+**/__pycache__/
+**/*.py[cod]
+**/.env*
+**/*.pem
+**/*.key
+**/.aws/
+**/.git/

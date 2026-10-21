@@ -1,0 +1,93 @@
+x-app: &app
+  image: orderflow-api:${ORDERFLOW_IMAGE_TAG:-local}
+  build:
+    context: .
+    target: runtime
+  environment: &app-environment
+    DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL using postgres as the host}
+    REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    DEBUG: ${DEBUG:-false}
+    JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY}
+    JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+    ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+    REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+    PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:?Set PAYMENT_WEBHOOK_SECRET}
+    PAYMENT_WEBHOOK_MAX_BYTES: ${PAYMENT_WEBHOOK_MAX_BYTES:-65536}
+    CACHE_ENABLED: ${CACHE_ENABLED:-true}
+    CACHE_DEFAULT_TTL_SECONDS: ${CACHE_DEFAULT_TTL_SECONDS:-300}
+    REDIS_CONNECT_TIMEOUT: ${REDIS_CONNECT_TIMEOUT:-2.0}
+    REDIS_SOCKET_TIMEOUT: ${REDIS_SOCKET_TIMEOUT:-2.0}
+    RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+    RATE_LIMIT_LOGIN_LIMIT: ${RATE_LIMIT_LOGIN_LIMIT:-10}
+    RATE_LIMIT_LOGIN_WINDOW_SECONDS: ${RATE_LIMIT_LOGIN_WINDOW_SECONDS:-60}
+    RATE_LIMIT_REFRESH_LIMIT: ${RATE_LIMIT_REFRESH_LIMIT:-30}
+    RATE_LIMIT_REFRESH_WINDOW_SECONDS: ${RATE_LIMIT_REFRESH_WINDOW_SECONDS:-60}
+    RATE_LIMIT_WEBHOOK_LIMIT: ${RATE_LIMIT_WEBHOOK_LIMIT:-120}
+    RATE_LIMIT_WEBHOOK_WINDOW_SECONDS: ${RATE_LIMIT_WEBHOOK_WINDOW_SECONDS:-60}
+    RATE_LIMIT_TRUSTED_PROXIES: ${RATE_LIMIT_TRUSTED_PROXIES:-[]}
+    AUDIT_FAILURE_TIMEOUT_SECONDS: ${AUDIT_FAILURE_TIMEOUT_SECONDS:-1.0}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    NOTIFICATION_MAX_ATTEMPTS: ${NOTIFICATION_MAX_ATTEMPTS:-3}
+    NOTIFICATION_CLAIM_LEASE_SECONDS: ${NOTIFICATION_CLAIM_LEASE_SECONDS:-300}
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  read_only: true
+  tmpfs:
+    - /tmp
+  stop_grace_period: 30s
+
+services:
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: [alembic, upgrade, head]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+    healthcheck:
+      disable: true
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-orderflow}
+      POSTGRES_USER: ${POSTGRES_USER:-orderflow_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  redis:
+    image: redis:7.0
+    # Cache and limiter state are disposable. Recovery is database-authoritative.
+    command: [redis-server, --save, '', --appendonly, 'no', --maxmemory, 128mb, --maxmemory-policy, noeviction]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    stop_grace_period: 10s
+
+volumes:
+  postgres_data:
