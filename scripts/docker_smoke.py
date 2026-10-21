@@ -47,7 +47,13 @@ def main() -> None:
                 with urlopen(req, timeout=15) as response:
                     return response.status, json.load(response)
             except HTTPError as exc:
-                return exc.code, json.load(exc)
+                body = exc.read().decode()
+                try:
+                    return exc.code, json.loads(body)
+                except json.JSONDecodeError:
+                    # A DB reconnect can briefly produce a plain-text 500;
+                    # readiness retries that status rather than failing to decode.
+                    return exc.code, {"detail": body}
 
         def ready() -> None:
             for _ in range(60):
