@@ -93,12 +93,12 @@ asyncio.run(seed())'''
             status, login = request("/api/v1/auth/login", {"email": "smoke@example.com", "password": "SmokePassword123!"})
             assert status == 200
             token = login["access_token"]
-            status, category = request("/api/v1/categories", {"name": "Docker persistence smoke"}, token)
+            status, category = request("/api/v1/categories", {"name": "Docker persistence smoke", "slug": "docker-persistence-smoke"}, token)
             assert status == 201
             path = f"/api/v1/categories/{category['id']}"
             assert request(path, token=token)[0] == 200
-            keys = compose("exec", "-T", "redis", "redis-cli", "--scan", "--pattern", "*categories*").stdout
-            assert keys.strip(), "Catalog reads must populate Redis"
+            cached = compose("exec", "-T", "redis", "redis-cli", "EXISTS", f"orderflow:v1:categories:detail:{category['id']}").stdout.strip()
+            assert cached == "1", "Catalog reads must populate the Redis detail key"
             invalid = {"email": "missing@example.com", "password": "incorrect"}
             assert request("/api/v1/auth/login", invalid)[0] == 401
             assert request("/api/v1/auth/login", invalid)[0] == 401
@@ -113,6 +113,9 @@ asyncio.run(seed())'''
             compose("restart", "api")
             ready()
             assert request(path, token=token)[0] == 200
+            stored = compose("exec", "-T", "postgres", "psql", "-U", "orderflow_smoke", "-d", "orderflow", "-tAc",
+                             "SELECT count(*) FROM categories WHERE slug = 'docker-persistence-smoke'").stdout.strip()
+            assert stored == "1", "Category must persist in PostgreSQL, independently of cache"
             print("PASS: PostgreSQL data survives restart and container recreation", flush=True)
 
             compose("stop", "redis")
@@ -148,6 +151,11 @@ asyncio.run(seed())'''
             compose("rm", "-sf", "api", "migrate")
             compose("up", "-d", "--wait", "--wait-timeout", "120")
             ready()
+            compose("stop", "api", "redis", "postgres")
+            for service in ("api", "redis", "postgres"):
+                container = compose("ps", "-aq", service).stdout.strip()
+                state = json.loads(subprocess.check_output(["docker", "inspect", "--format", "{{json .State}}", container], text=True))
+                assert state["ExitCode"] == 0 and not state["OOMKilled"], f"{service} did not stop gracefully"
             print("PASS: graceful stop, invalid credentials and migration failures block API; clean recovery", flush=True)
         except BaseException:
             print(compose("logs", "--no-color", "--tail", "100", check=False).stdout)
