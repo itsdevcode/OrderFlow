@@ -5,3 +5,6 @@ venv/
 __pycache__/
 *.py[cod]
 alembic/script.py.mako
+
+# Local CI test output
+test-results.xml

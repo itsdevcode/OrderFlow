@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Tests, typing and migrations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: orderflow_migrations
+          POSTGRES_USER: orderflow_ci
+          POSTGRES_PASSWORD: ci_only_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orderflow_ci -d orderflow_migrations"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:7.0
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DATABASE_URL: postgresql+asyncpg://orderflow_ci:ci_only_password@127.0.0.1:5432/orderflow_migrations
+      TEST_DATABASE_URL: postgresql+asyncpg://orderflow_ci:ci_only_password@127.0.0.1:5432/orderflow_test
+      REDIS_URL: redis://127.0.0.1:6379/0
+      TEST_REDIS_URL: redis://127.0.0.1:6379/1
+      DEBUG: 'false'
+      JWT_SECRET_KEY: ci_only_jwt_key_never_use_in_production
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: '15'
+      REFRESH_TOKEN_EXPIRE_DAYS: '7'
+      PAYMENT_WEBHOOK_SECRET: ci_only_webhook_key_never_use_in_production
+      CACHE_ENABLED: 'true'
+      CACHE_DEFAULT_TTL_SECONDS: '300'
+      RATE_LIMIT_ENABLED: 'true'
+      RATE_LIMIT_LOGIN_LIMIT: '10'
+      RATE_LIMIT_LOGIN_WINDOW_SECONDS: '60'
+      RATE_LIMIT_REFRESH_LIMIT: '30'
+      RATE_LIMIT_REFRESH_WINDOW_SECONDS: '60'
+      RATE_LIMIT_WEBHOOK_LIMIT: '120'
+      RATE_LIMIT_WEBHOOK_WINDOW_SECONDS: '60'
+      RATE_LIMIT_TRUSTED_PROXIES: '[]'
+      LOG_LEVEL: INFO
+      AUDIT_FAILURE_TIMEOUT_SECONDS: '1.0'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pip check
+      - name: Validate configuration and services
+        run: python -m scripts.ci_services
+      - name: Check migrations on disposable database
+        run: |
+          alembic heads
+          python -m scripts.ci_migrations
+      - name: Type check
+        run: pyright --pythonpath "$(which python)" app
+      - name: Full test suite
+        run: pytest -v --junitxml=test-results.xml
