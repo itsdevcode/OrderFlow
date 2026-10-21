@@ -60,7 +60,7 @@ OrderFlow/
 ### 1. Prerequisites
 
 - **Python 3.11+** installed.
-- **PostgreSQL** or **SQLite** (Async supported).
+- **PostgreSQL 16** and **Redis 7.0** for integration tests (PostgreSQL-specific migrations and JSONB are required).
 
 ### 2. Environment Setup
 
@@ -76,7 +76,7 @@ python3 -m venv venv
 source venv/bin/activate
 
 # Install dependencies
-pip install -r requirements.txt # or pip install -e .
+pip install -r requirements-dev.txt
 ```
 
 Create a `.env` file in the root directory:
@@ -85,9 +85,9 @@ Create a `.env` file in the root directory:
 APP_NAME="OrderFlow API"
 APP_VERSION="1.0.0"
 DEBUG=True
-DATABASE_URL="sqlite+aiosqlite:///./orderflow.db"
-# For PostgreSQL:
-# DATABASE_URL="postgresql+asyncpg://user:password@localhost:5432/orderflow"
+DATABASE_URL="postgresql+asyncpg://orderflow_user:orderflow_password@localhost:5432/orderflow"
+JWT_SECRET_KEY="change_me_in_production"
+PAYMENT_WEBHOOK_SECRET="development_only_change_me"
 ```
 
 ---
@@ -426,3 +426,90 @@ JSON stdout records contain `timestamp`, `severity`, `logger`, `event`, `request
 `LOG_LEVEL` controls the application namespace (default `INFO`). Lifespan configures the formatter idempotently. Uvicorn's raw access logs are disabled in favor of the middleware's structured record; its error logger uses the same safe formatter so raw query strings and exception payloads cannot bypass it. Root and other third-party logger configurations are unchanged. SQLAlchemy parameter echo is disabled even when `DEBUG=true`, and engine error parameters are hidden. Custom deployment log handlers must preserve these privacy rules; do not enable raw request/SQL debug logging in production.
 
 Audit rows are application-managed history, not a tamper-proof ledger: a database owner can modify them. No retention/export policy or administrative UI is included. Anonymous failed-login audits may be lost during an audit database outage. Background tasks deliberately spawned outside the awaited request lifecycle need their own explicit context/transaction policy. Success audits prove a committed business transition, not that the client received its response.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pull requests targeting `main`, pushes to
+`main`, and manual dispatch. The `Tests, typing and migrations` job uses Python
+3.12, PostgreSQL 16 and Redis 7.0 on Ubuntu 24.04, with a 25-minute timeout.
+It installs pinned pip dependencies from `requirements-dev.txt` (which includes
+`requirements.txt`) and caches downloads using both files. Update these pins
+intentionally and verify with a clean virtual environment; no Poetry/uv project
+or editable installation is configured.
+
+The required quality sequence is dependency consistency, Settings/service
+validation, migration smoke checks, `pyright app`, and the entire `pytest -v`
+suite. No tests are filtered or run in parallel. Existing fixtures recreate the
+test schema per test and close Redis connections after each test's event loop.
+The workflow has read-only repository permission, uses official Actions, and
+uses CI-only credentials without deployment or publishing steps. Superseded
+runs are cancelled only for the same PR; unrelated PRs have separate groups.
+
+### Run the same checks locally
+
+Use disposable PostgreSQL 16 and Redis 7.0 instances on localhost. Create an
+**empty** `orderflow_migrations` database owned by a role with `CREATEDB` (CI uses
+`orderflow_ci` / `ci_only_password`). Leave `orderflow_test` absent: the service
+check creates it and refuses to reuse an existing database. Do not point these
+commands or pytest at shared resources: tests drop tables and flush Redis DB 1.
+
+```bash
+python3.12 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m pip check
+
+export DATABASE_URL=postgresql+asyncpg://orderflow_ci:ci_only_password@127.0.0.1:5432/orderflow_migrations
+export TEST_DATABASE_URL=postgresql+asyncpg://orderflow_ci:ci_only_password@127.0.0.1:5432/orderflow_test
+export REDIS_URL=redis://127.0.0.1:6379/0
+export TEST_REDIS_URL=redis://127.0.0.1:6379/1
+export DEBUG=false
+export JWT_SECRET_KEY=ci_only_jwt_key_never_use_in_production
+export JWT_ALGORITHM=HS256
+export PAYMENT_WEBHOOK_SECRET=ci_only_webhook_key_never_use_in_production
+export CACHE_ENABLED=true
+export RATE_LIMIT_ENABLED=true
+export RATE_LIMIT_TRUSTED_PROXIES='[]'
+
+python -m scripts.ci_services
+alembic heads
+python -m scripts.ci_migrations
+pyright --pythonpath "$(which python)" app
+pytest -v --junitxml=test-results.xml
+```
+
+Other workflow environment values explicitly mirror Settings defaults. The
+`--pythonpath` option makes Pyright inspect the active interpreter's packages,
+including in CI where the repository's optional local `venv/` does not exist.
+Environment variables override `.env`; `DEBUG` must be a boolean such as
+`false`, never `release`. CI explicitly supplies the webhook secret so Settings
+validation runs with debug disabled.
+
+The migration helper refuses remote or differently named databases and requires
+an empty public schema. It rejects multiple migration heads, runs
+`alembic upgrade head`, compares `alembic_version` to the script head, prints
+`alembic current`, downgrades the latest revision to its parent, verifies that
+revision, then upgrades and verifies head again. This is destructive smoke
+testing only on the dedicated disposable migration database. Integration tests
+use a different database because their metadata fixtures do not apply Alembic
+migrations. To repeat this fresh-database check locally, recreate both disposable
+databases first; never downgrade an application database for this purpose.
+
+### Troubleshooting GitHub Actions
+
+Open the PR's **Checks** tab and expand the first failing step. Container health
+failures usually indicate service startup problems; inspect the service logs.
+The configuration check fails early if PostgreSQL or either Redis database is
+unreachable, including when tests might otherwise tolerate a Redis outage.
+Installation failures should be reproduced in a clean Python 3.12 environment;
+`pip check` identifies dependency conflicts. Migration failures show revision
+transitions; inspect the failing revision and keep the migration graph linear.
+Type failures must be fixed in code, and pytest prints failing cases and
+tracebacks. Do not paste credentials or complete environment dumps into logs.
+`test-results.xml` is produced in the runner workspace for tooling; artifacts
+are not published by this workflow.
+
+GitHub branch protection is configured separately: require
+**Tests, typing and migrations** before merging. Adding this workflow does not
+change repository protection rules. A passing local run does not establish a
+passing GitHub Actions run; inspect the actual PR run before approval.
