@@ -437,6 +437,11 @@ It installs pinned pip dependencies from `requirements-dev.txt` (which includes
 intentionally and verify with a clean virtual environment; no Poetry/uv project
 or editable installation is configured.
 
+The separate `Docker Compose smoke checks` job builds the runtime image and
+exercises a unique disposable Compose project, including startup, readiness,
+Redis policies, data durability, failed migrations and graceful shutdown. It
+does not publish images or deploy the application.
+
 The required quality sequence is dependency consistency, Settings/service
 validation, migration smoke checks, `pyright app`, and the entire `pytest -v`
 suite. No tests are filtered or run in parallel. Existing fixtures recreate the
@@ -513,3 +518,155 @@ GitHub branch protection is configured separately: require
 **Tests, typing and migrations** before merging. Adding this workflow does not
 change repository protection rules. A passing local run does not establish a
 passing GitHub Actions run; inspect the actual PR run before approval.
+
+## Docker development environment
+
+Install Docker Engine with the Compose plugin (Compose 2.20+ or newer) or
+Docker Desktop with WSL integration enabled on Windows. Docker must be running;
+`docker version` and `docker compose version` should succeed. No host Python,
+PostgreSQL or Redis installation is needed for the application stack.
+
+```bash
+cp .env.example .env
+docker compose config --quiet
+docker compose up --build -d
+docker compose ps
+docker compose logs --tail=100 api
+curl --fail http://localhost:8000/health
+curl --fail http://localhost:8000/health/db
+```
+
+`.env.example` now contains local Docker settings. Keep `.env` untracked. The
+example passwords and signing keys are development placeholders: replace them
+before any deployment. `POSTGRES_*` provisions the database on an empty volume;
+`DATABASE_URL` must contain matching credentials and use `postgres:5432`.
+Percent-encode reserved characters in URL passwords. `REDIS_URL` uses
+`redis:6379/0`. Host-based Python commands need localhost URLs and separate
+host services; Compose does not publish database/cache ports. Test URLs in the
+example are for isolated host tests and are not passed into the API container.
+Use `docker compose config --quiet` for validation; plain `config` prints
+resolved credentials, so do not publish its output.
+
+The default API is bound to `127.0.0.1:8000`; use `API_PORT` to avoid a local
+port collision. PostgreSQL and Redis communicate on Compose's private service
+network without host port mappings. PostgreSQL uses a named `postgres_data`
+volume scoped to the Compose project. Redis deliberately disables RDB and AOF
+persistence; cache and rate-limit state is lost when Redis restarts. Redis uses
+a 128 MB cap with `noeviction` to avoid silently evicting active security
+buckets; memory exhaustion follows the existing Redis-unavailable policies.
+This is a local durability choice, not a production security or HA guarantee.
+
+The multi-stage Python 3.12 image installs the pinned runtime requirements using
+binary wheels; development/test tools and compiler packages are absent. Build
+context is allowlisted by `.dockerignore`, and only application/migration files
+are copied. The API runs as UID 10001 with dropped capabilities, no privilege
+escalation, a read-only root filesystem and writable temporary memory storage.
+Uvicorn runs directly as the container process, binds to `0.0.0.0:8000`, uses no
+reload, and has 25 seconds to drain before Compose's 30-second stop deadline.
+Proxy-header rewriting is explicitly disabled so application rate limiting sees
+the socket peer. The application separately trusts only the proxy CIDRs in
+`RATE_LIMIT_TRUSTED_PROXIES` (empty by default). Configure exact trusted proxies
+and TLS at the ingress for a real deployment; never blindly trust all clients.
+
+### Startup, migrations and health
+
+Compose waits for PostgreSQL and Redis health checks. The one-shot `migrate`
+service runs `alembic upgrade head` after PostgreSQL becomes healthy, and the API
+starts only after that service exits successfully. Migration failures leave the
+API stopped. Migrations run once per Compose startup operation, outside API
+replicas; coordinate a single migration release job for deployments spanning
+multiple Compose projects or hosts. Do not scale the migration service.
+
+```bash
+# View migration output and current revision.
+docker compose logs --tail=100 migrate
+docker compose run --rm migrate alembic current
+
+# After pulling application/schema changes: stop traffic, migrate, then rebuild.
+docker compose stop api
+docker compose build
+docker compose run --rm migrate alembic upgrade head
+docker compose up -d --force-recreate migrate api
+
+# Logs and normal service operations.
+docker compose logs --tail=100 api postgres redis
+docker compose restart api
+docker compose stop
+docker compose up -d
+docker compose down
+```
+
+Run the update commands sequentially and stop if migration fails. `restart`
+does not rebuild images or apply changed environment variables; use `up -d
+--build` when configuration or source changes. Existing volumes are retained by
+`down`. Do not use automatic downgrades: some migrations destroy data. Back up
+and review schema/application compatibility before any rollback. A named local
+volume is not a backup; production needs tested backups, restoration, access
+controls, secret management, monitoring and a coordinated deployment process.
+Images track Python 3.12, PostgreSQL 16 and Redis 7.0 patch releases; pin reviewed
+image digests in your release process when immutable base images are required.
+
+`/health` reports process liveness. `/health/db` executes `SELECT 1` and is the
+container readiness health check. Uvicorn serves traffic after lifespan startup;
+Compose additionally gates it on completed migrations. A separate readiness
+route is unnecessary for this setup. Redis is excluded from database readiness:
+after startup, catalog operations continue against PostgreSQL during a Redis
+outage, login/refresh return 503 with Retry-After, and payment webhooks retain
+HMAC authentication and database idempotency. Compose initially requires Redis
+to be healthy, but does not stop a running API when Redis later becomes
+unavailable. A Redis restart resets rate-limit windows; stronger continuity
+requirements need a durable, secured Redis deployment.
+
+### Tests and disposable resets
+
+The standard image intentionally excludes test tools. Run the full host suite
+with the isolated PostgreSQL/Redis instructions in Continuous integration:
+
+```bash
+python -m pip install -r requirements-dev.txt
+pyright --pythonpath "$(which python)" app
+pytest -v
+
+# Requires a running Docker engine; creates its own project and volumes.
+python3 -m scripts.docker_smoke
+```
+
+The smoke script builds and runs a unique `orderflow-smoke-*` project on port
+18000, seeds disposable data, checks real cache/rate-limit HTTP behavior, restarts
+and recreates PostgreSQL, exercises Redis outage/recovery, injects invalid DB
+credentials and a failed migration, then verifies recovery and graceful stop.
+It removes only its own generated project's containers and volumes in cleanup.
+CI runs it separately from the complete integration suite.
+
+For a manual throwaway sandbox, choose a unique project name **before its first
+startup** and use it on every command:
+
+```bash
+# Only use this name for a new disposable sandbox, never existing valuable data.
+docker compose -p orderflow-disposable up --build -d
+# Destructive: deletes only that sandbox's database volume. Review the name first.
+docker compose -p orderflow-disposable down --volumes
+```
+
+Never reset an existing developer or production project without explicit approval.
+
+### Docker troubleshooting
+
+- If the API does not start, inspect `docker compose ps -a` and `docker compose
+  logs --tail=100 migrate postgres`. Fix the migration/configuration error before
+  recreating `migrate` and `api` with `up -d --force-recreate migrate api`.
+- If health checks fail, verify `DATABASE_URL` uses `postgres`, the URL password
+  matches the initialized volume, and Redis uses `redis`. Changing
+  `POSTGRES_PASSWORD` in `.env` does not rotate an existing database password;
+  rotate it deliberately rather than deleting a valuable volume.
+- If port 8000 is occupied, set `API_PORT` in `.env`. If Docker is unavailable in
+  WSL, enable this distribution in Docker Desktop's WSL integration settings.
+- If Redis is unavailable, catalog reads can succeed while login/refresh return
+  503. Restore Redis; connection recovery is bounded and may take several seconds.
+- Images contain no default users or business data; provision accounts through
+  the existing application administration workflow. The smoke-only seeded admin
+  is confined to a disposable project.
+
+This Compose setup is a reproducible development baseline, not a managed
+production deployment. Production needs TLS, external secret injection, reviewed
+network access, durable backups and an appropriate Redis availability policy.
