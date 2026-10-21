@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import patch
 from uuid import uuid4
@@ -265,7 +266,28 @@ async def test_token_reuse_revocation_and_audit_are_atomic(client: AsyncClient, 
 
 async def test_failed_login_audit_timeout_still_rejects_credentials(client: AsyncClient):
     # Controlled timeout injection; no sleeps or external dependency failure.
-    with patch("app.services.audit.asyncio.timeout", side_effect=TimeoutError):
+    with patch("app.services.audit.timeout", side_effect=TimeoutError):
         response = await client.post("/api/v1/auth/login", json={"email": "unknown@example.com", "password": "private"})
     assert response.status_code == 401
     assert await audits(AuditAction.LOGIN_FAILED) == []
+
+
+async def test_real_audit_insert_constraint_failure_rolls_back_stock(client: AsyncClient, admin_user: User, customer_user: User):
+    _, product_id, warehouse_id, _, _ = await prepared_order(client, admin_user, customer_user)
+    async with TestSessionLocal() as db:
+        # Actor -1 does not exist: PostgreSQL rejects the actual audit INSERT.
+        with pytest.raises(AuditWriteError):
+            await InventoryService(db).adjust_stock(product_id, warehouse_id, InventoryAdjustment(available_quantity_change=5), actor_id=-1)
+    async with TestSessionLocal() as db:
+        assert (await db.execute(select(Inventory.available_quantity).where(Inventory.product_id == product_id))).scalar_one() == 99
+    assert len(await audits(AuditAction.INVENTORY_ADJUSTED)) == 1
+
+
+async def test_concurrent_duplicate_webhooks_have_one_payment_audit(client: AsyncClient, admin_user: User, customer_user: User):
+    order_id, _, _, _, token = await prepared_order(client, admin_user, customer_user)
+    payment = await client.post(f"/api/v1/orders/{order_id}/payments", headers={"Authorization": f"Bearer {token}"}, json={"idempotency_key": "audit-concurrent"})
+    assert payment.status_code == 201
+    raw, headers = make_signed_webhook_payload("audit-concurrent-event", "payment.succeeded", payment.json()["provider_payment_id"], "100.00")
+    responses = await asyncio.gather(*[client.post("/api/v1/webhooks/payments", content=raw, headers=headers) for _ in range(3)])
+    assert all(response.status_code == 200 for response in responses)
+    assert len(await audits(AuditAction.PAYMENT_SUCCEEDED)) == 1

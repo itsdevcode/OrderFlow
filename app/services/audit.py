@@ -1,4 +1,4 @@
-import asyncio
+from asyncio import timeout
 import logging
 from collections.abc import Mapping
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -67,7 +67,7 @@ class AuditService:
         replace an authentication rejection with a diagnostic/database error.
         """
         try:
-            async with asyncio.timeout(settings.audit_failure_timeout_seconds):
+            async with timeout(settings.audit_failure_timeout_seconds):
                 async with session_module.AsyncSessionLocal() as db:
                     async with db.begin():
                         await AuditService(db).stage(AuditAction.LOGIN_FAILED)
