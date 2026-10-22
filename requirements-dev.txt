@@ -6,5 +6,6 @@ Pygments==2.21.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
 pytest-cov==7.0.0
+coverage==7.10.7
 pyright==1.1.414
 nodeenv==1.11.0
