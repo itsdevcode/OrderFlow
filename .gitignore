@@ -8,3 +8,6 @@ alembic/script.py.mako
 
 # Local CI test output
 test-results.xml
+.coverage
+coverage.xml
+htmlcov/

@@ -92,6 +92,14 @@ class AuthService:
         except (jwt.InvalidTokenError, ValueError) as exc:
             raise InvalidTokenError from exc
 
+        # Lock the user before reading any token. A token-row lock alone can
+        # deadlock when replay detection revokes another concurrently rotated
+        # token belonging to the same user. All refresh/logout paths use this
+        # shared lock order and hold it through the audited commit.
+        user = await self.user_repository.get_by_id(user_id, for_update=True)
+        if user is None:
+            raise InvalidTokenError
+
         rt_record = await self.refresh_token_repository.get_by_jti(jti)
         if rt_record is None:
             raise InvalidTokenError
@@ -104,8 +112,7 @@ class AuthService:
             await self._commit_event(AuditAction.TOKEN_REUSE_DETECTED, user_id)
             raise InvalidTokenError
 
-        user = await self.user_repository.get_by_id(user_id)
-        if user is None or not user.is_active:
+        if not user.is_active:
             raise InvalidTokenError
 
         await self.refresh_token_repository.revoke(jti)
@@ -145,6 +152,10 @@ class AuthService:
                 raise InvalidTokenError
         except (jwt.InvalidTokenError, ValueError) as exc:
             raise InvalidTokenError from exc
+
+        user = await self.user_repository.get_by_id(user_id, for_update=True)
+        if user is None:
+            raise InvalidTokenError
 
         rt_record = await self.refresh_token_repository.get_by_jti(jti)
         if rt_record is None:

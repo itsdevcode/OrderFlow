@@ -10,18 +10,6 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
-import app.models  # pyright: ignore[reportUnusedImport]
-from app.db.base import Base
-from app.db.session import get_db
-from app.main import app as fastapi_app
-
-from app.core.config import settings
-from app.core.redis import close_redis_client, get_redis_client, init_redis_client
-from app.core.roles import RoleName
-from app.core.security import hash_password
-from app.models.role import Role
-from app.models.user import User
-
 TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL",
     "postgresql+asyncpg://orderflow_user:orderflow_password@localhost:5432/orderflow_test",
@@ -30,11 +18,34 @@ TEST_REDIS_URL = os.getenv(
     "TEST_REDIS_URL",
     "redis://localhost:6379/1",
 )
+from tests.resource_safety import validate_test_resources
+
+validate_test_resources(TEST_DATABASE_URL, TEST_REDIS_URL)
+
+# Configure every imported engine/session factory (including background workers)
+# before importing app.main. No test path may inherit the developer DATABASE_URL.
+from app.core.config import settings
+
+settings.database_url = TEST_DATABASE_URL
 settings.redis_url = TEST_REDIS_URL
+
+import app.models  # pyright: ignore[reportUnusedImport]
+from app.db.base import Base
+from app.db.session import get_db
+from app.main import app as fastapi_app
+
+from app.core.redis import close_redis_client, get_redis_client, init_redis_client
+from app.core.roles import RoleName
+from app.core.security import hash_password
+from app.models.role import Role
+from app.models.user import User
+
+
 
 test_engine = create_async_engine(
     TEST_DATABASE_URL,
     poolclass=NullPool,
+    hide_parameters=True,
 )
 
 TestSessionLocal = async_sessionmaker(
@@ -94,10 +105,17 @@ from app.db import session as db_session_module
 
 @pytest.fixture(autouse=True)
 def bind_test_session_local():
+    from app.api import background
+
     orig_session_local = db_session_module.AsyncSessionLocal
+    orig_background_session = background.AsyncSessionLocal
     db_session_module.AsyncSessionLocal = TestSessionLocal
-    yield
-    db_session_module.AsyncSessionLocal = orig_session_local
+    background.AsyncSessionLocal = TestSessionLocal
+    try:
+        yield
+    finally:
+        db_session_module.AsyncSessionLocal = orig_session_local
+        background.AsyncSessionLocal = orig_background_session
 
 
 @pytest_asyncio.fixture
@@ -113,13 +131,14 @@ async def client(
 
     transport = ASGITransport(app=fastapi_app)
 
-    async with AsyncClient(
-        transport=transport,
-        base_url="http://test",
-    ) as test_client:
-        yield test_client
-
-    fastapi_app.dependency_overrides.clear()
+    try:
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as test_client:
+            yield test_client
+    finally:
+        fastapi_app.dependency_overrides.clear()
 
 @pytest_asyncio.fixture
 async def admin_user(db_session: AsyncSession) -> User:
