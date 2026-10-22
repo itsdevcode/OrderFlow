@@ -96,4 +96,4 @@ jobs:
       - name: Type check
         run: pyright --pythonpath "$(which python)" app
       - name: Full test suite
-        run: pytest -v --junitxml=test-results.xml
+        run: pytest -v --cov=app --cov-branch --cov-report=term-missing --cov-report=xml --junitxml=test-results.xml

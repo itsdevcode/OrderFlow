@@ -79,12 +79,16 @@ class UserRepository:
         await self.db.delete(user)
         await self.db.flush()
 
-    async def get_by_id(self, user_id: int) -> User | None:
+    async def get_by_id(self, user_id: int, *, for_update: bool = False) -> User | None:
         stmt = (
             select(User)
             .options(selectinload(User.role))
             .where(User.id == user_id)
         )
+        if for_update:
+            # Serialize refresh mutations without blocking the KEY SHARE locks
+            # PostgreSQL uses for token/audit foreign-key checks.
+            stmt = stmt.with_for_update(key_share=True).execution_options(populate_existing=True)
 
         result = await self.db.execute(stmt)
 
